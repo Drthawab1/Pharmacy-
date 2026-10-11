@@ -32,7 +32,7 @@ function modal(html) {
 
 const S = {
   user: null, profile: null, settingUp: false, tab: "pos", refresh: null, unsubs: [],
-  settings: { rate: 0, round: 50, warnDays: 60, pharmacy: "الصيدلية", adminPhone: "" },
+  settings: { rate: 0, round: 50, warnDays: 60, defaultMarkup: 25, pharmacy: "الصيدلية", adminPhone: "" },
   products: [], cart: [], debts: [], cheques: [], users: [], todaySales: [], monthSales: [], month: ym(new Date()), askedRate: false
 };
 const isAdmin = () => S.profile?.role === "admin";
@@ -358,17 +358,25 @@ function viewProducts() {
 }
 function productModal(p, bc = "") {
   const adm = isAdmin(), lock = p && !adm;
+  const initM = p ? (p.markup ?? (p.costUSD > 0 && p.priceUSD > 0 ? Math.round((p.priceUSD / p.costUSD - 1) * 1000) / 10 : "")) : (S.settings.defaultMarkup ?? "");
   const m = modal(`<h3>${p ? "تعديل صنف" : "صنف جديد"}</h3>${lock ? `<p style="font-size:13px;color:var(--mut)">الصيدلي يستطيع تعديل الكمية فقط.</p>` : ""}
   <label>الاسم</label><input id="fn" value="${esc(p?.name)}" ${lock ? "disabled" : ""}>
   <label>الباركود</label><div class="row"><input id="fb" value="${esc(p?.barcode || bc)}" ${lock ? "disabled" : ""}>${lock ? "" : `<button class="btn sec" id="fs">📷</button>`}</div>
-  <div class="row"><div><label>سعر البيع ($)</label><input id="fp" type="number" step="0.01" inputmode="decimal" value="${p?.priceUSD ?? ""}" ${lock ? "disabled" : ""}></div>
-  <div><label>سعر التكلفة ($)</label><input id="fc" type="number" step="0.01" inputmode="decimal" value="${p?.costUSD ?? ""}" ${lock ? "disabled" : ""}></div></div>
+  <div class="row"><div><label>التكلفة ($)</label><input id="fc" type="number" step="0.01" inputmode="decimal" value="${p?.costUSD ?? ""}" ${lock ? "disabled" : ""}></div>
+  <div><label>نسبة الربح %</label><input id="fm" type="number" step="0.1" inputmode="decimal" value="${initM}" ${lock ? "disabled" : ""}></div>
+  <div><label>سعر البيع ($)</label><input id="fp" type="number" step="0.01" inputmode="decimal" value="${p?.priceUSD ?? ""}" ${lock ? "disabled" : ""}></div></div>
   <p id="fsd" style="color:var(--p);font-weight:bold;margin:6px 0"></p>
   <div class="row"><div><label>الكمية</label><input id="fq" type="number" inputmode="numeric" value="${p?.qty ?? ""}"></div>
   <div><label>تاريخ الانتهاء</label><input id="fe" type="date" value="${p?.expiry || ""}" ${lock ? "disabled" : ""}></div></div>
   <div class="row" style="margin-top:12px"><button class="btn" id="fok">حفظ</button>${p && adm ? `<button class="btn danger" id="fdel">حذف</button>` : ""}<button class="btn sec" id="fx">إلغاء</button></div>`);
-  const upd = () => $("#fsd", m).textContent = `بالجنيه اليوم: ${nf(priceSDG({ priceUSD: Number($("#fp", m).value) }))} ج`;
-  $("#fp", m).oninput = upd; upd();
+  const r2 = v => Math.round(v * 100) / 100;
+  const upd = () => {
+    const c = Number($("#fc", m).value) || 0, pr = Number($("#fp", m).value) || 0;
+    $("#fsd", m).textContent = `بالجنيه اليوم: ${nf(priceSDG({ priceUSD: pr }))} ج` + (c > 0 && pr > 0 ? ` • ربح الوحدة: ${nf((pr - c) * (Number(S.settings.rate) || 0))} ج (${((pr / c - 1) * 100).toFixed(1)}%)` : "");
+  };
+  const fromMarkup = () => { const c = Number($("#fc", m).value); if (c > 0 && $("#fm", m).value !== "") $("#fp", m).value = r2(c * (1 + Number($("#fm", m).value) / 100)); upd(); };
+  const fromPrice = () => { const c = Number($("#fc", m).value), pr = Number($("#fp", m).value); if (c > 0 && pr > 0) $("#fm", m).value = Math.round((pr / c - 1) * 1000) / 10; upd(); };
+  $("#fc", m).oninput = fromMarkup; $("#fm", m).oninput = fromMarkup; $("#fp", m).oninput = fromPrice; upd();
   $("#fs", m) && ($("#fs", m).onclick = () => scan(c => $("#fb", m).value = c));
   $("#fx", m).onclick = m.close;
   $("#fdel", m) && ($("#fdel", m).onclick = async () => { if (confirm("حذف الصنف؟")) { await deleteDoc(doc(db, "products", p.id)); m.close(); } });
@@ -377,7 +385,7 @@ function productModal(p, bc = "") {
     if (lock) { updateDoc(doc(db, "products", p.id), { qty }).catch(e => toast(e.message)); m.close(); return; }
     if (!name) return toast("اكتب الاسم");
     if (barcode && S.products.some(x => x.barcode === barcode && x.id !== p?.id)) return toast("هذا الباركود مسجل لصنف آخر");
-    const data = { name, barcode, priceUSD: Number($("#fp", m).value) || 0, costUSD: Number($("#fc", m).value) || 0, qty, expiry: $("#fe", m).value || "" };
+    const data = { name, barcode, priceUSD: Number($("#fp", m).value) || 0, costUSD: Number($("#fc", m).value) || 0, markup: Number($("#fm", m).value) || 0, qty, expiry: $("#fe", m).value || "" };
     (p ? updateDoc(doc(db, "products", p.id), data) : addDoc(collection(db, "products"), { ...data, createdAt: serverTimestamp() })).catch(e => toast(e.message));
     m.close(); toast("تم الحفظ");
   };
@@ -396,7 +404,7 @@ function viewDash() {
   S.refresh = () => {
     const t = sumSales(S.todaySales), m = sumSales(S.monthSales);
     $("#td").innerHTML = stat("المبيعات", nf(t.total) + " ج") + stat("الأرباح", nf(t.profit) + " ج") + stat("عدد الفواتير", t.n) + stat("بالدولار", "$" + (S.settings.rate ? (t.total / S.settings.rate).toFixed(0) : 0));
-    $("#mn").innerHTML = stat("مبيعات الشهر", nf(m.total) + " ج") + stat("أرباح الشهر", nf(m.profit) + " ج") + stat("الفواتير", m.n) + stat("متوسط الفاتورة", nf(m.n ? m.total / m.n : 0) + " ج");
+    $("#mn").innerHTML = stat("مبيعات الشهر", nf(m.total) + " ج") + stat("أرباح الشهر", nf(m.profit) + " ج") + stat("الفواتير", m.n) + stat("متوسط الفاتورة", nf(m.n ? m.total / m.n : 0) + " ج") + stat("نسبة الربح", (m.total ? (m.profit / m.total * 100).toFixed(1) : 0) + "%");
     $("#ls").innerHTML = S.todaySales.slice(0, 30).map(s => `<div data-id="${s.id}"><span>${esc(s.no)} <small>${fmtTime(toDate(s.createdAt)).slice(11)} • ${esc(s.cashier)} • ${s.items.length} صنف${s.pay === "credit" ? " • آجل" : ""}</small></span><b>${nf(s.total)} ج</b></div>`).join("") || `<p style="text-align:center;color:var(--mut)">لا مبيعات بعد</p>`;
     $("#ls").querySelectorAll("[data-id]").forEach(d => d.onclick = () => showReceipt(S.todaySales.find(s => s.id === d.dataset.id)));
     $("#al").innerHTML = alerts().map(a => `<div class="alert ${a.red ? "red" : ""}">${a.t}</div>`).join("") || `<p style="color:var(--grn)">لا تنبيهات ✔</p>`;
@@ -450,11 +458,26 @@ function viewSettings() {
   <label>اسم الصيدلية</label><input id="s1" value="${esc(S.settings.pharmacy)}">
   <label>واتساب المدير (مع كود الدولة)</label><input id="s2" inputmode="tel" value="${esc(S.settings.adminPhone)}">
   <div class="row"><div><label>تنبيه الانتهاء قبل (يوم)</label><input id="s3" type="number" value="${S.settings.warnDays}"></div><div><label>تقريب السعر إلى أقرب</label><input id="s4" type="number" value="${S.settings.round}"></div></div>
+  <div class="row"><div><label>نسبة الربح الافتراضية %</label><input id="s6" type="number" step="0.1" inputmode="decimal" value="${S.settings.defaultMarkup ?? 25}"></div><button class="btn sec" id="sap" style="align-self:flex-end">تطبيق على كل الأصناف</button></div>
   <label>عرض ورق الطابعة (على هذا الجهاز)</label><select id="s5"><option value="384" ${localStorage.paper !== "576" ? "selected" : ""}>58 مم</option><option value="576" ${localStorage.paper === "576" ? "selected" : ""}>80 مم</option></select>
   <div style="height:10px"></div><button class="btn" id="ss">حفظ</button></div>
   <div class="card"><div class="row"><h3 style="flex:1;margin:0">👥 الحسابات</h3><button class="btn sm" id="ua">+ صيدلي</button></div><div id="ul" class="list"></div></div>`;
-  $("#ss").onclick = async () => { localStorage.paper = $("#s5").value; await setDoc(doc(db, "settings", "main"), { pharmacy: $("#s1").value.trim(), adminPhone: $("#s2").value.replace(/\D/g, ""), warnDays: Number($("#s3").value) || 60, round: Number($("#s4").value) || 1 }, { merge: true }); toast("تم الحفظ"); };
+  $("#ss").onclick = async () => { localStorage.paper = $("#s5").value; await setDoc(doc(db, "settings", "main"), { pharmacy: $("#s1").value.trim(), adminPhone: $("#s2").value.replace(/\D/g, ""), warnDays: Number($("#s3").value) || 60, round: Number($("#s4").value) || 1, defaultMarkup: Number($("#s6").value) || 0 }, { merge: true }); toast("تم الحفظ"); };
   $("#ua").onclick = userModal;
+  $("#sap").onclick = async () => {
+    const mk = Number($("#s6").value);
+    if (!(mk >= 0)) return toast("اكتب نسبة صحيحة");
+    const l = S.products.filter(p => p.costUSD > 0);
+    if (!l.length) return toast("لا توجد أصناف لها تكلفة مسجلة");
+    if (!confirm(`سيتم تغيير سعر البيع لـ ${l.length} صنف إلى (التكلفة + ${mk}%) وسيُلغى أي سعر يدوي. متابعة؟`)) return;
+    for (let i = 0; i < l.length; i += 400) {
+      const b = writeBatch(db);
+      l.slice(i, i + 400).forEach(p => b.update(doc(db, "products", p.id), { markup: mk, priceUSD: Math.round(p.costUSD * (1 + mk / 100) * 100) / 100 }));
+      await b.commit();
+    }
+    await setDoc(doc(db, "settings", "main"), { defaultMarkup: mk }, { merge: true });
+    toast("تم تحديث أسعار " + l.length + " صنف");
+  };
   S.refresh = () => {
     $("#ul").innerHTML = S.users.map(u => `<div data-u="${u.id}"><span>${esc(u.name)}<small>${esc(u.username)} • ${u.role === "admin" ? "مدير" : "صيدلي"}</small></span>${u.id === S.user.uid ? "" : `<span class="tag ${u.disabled ? "red" : ""}">${u.disabled ? "موقوف — اضغط للتفعيل" : "نشط — اضغط للإيقاف"}</span>`}</div>`).join("");
     $("#ul").querySelectorAll("[data-u]").forEach(e => e.onclick = () => { const u = S.users.find(x => x.id === e.dataset.u); if (u.id !== S.user.uid) updateDoc(doc(db, "users", u.id), { disabled: !u.disabled }); });
