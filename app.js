@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, query, where, orderBy, serverTimestamp, increment, writeBatch } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, query, where, orderBy, serverTimestamp, increment, writeBatch, limit } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ============ تهيئة ============ */
@@ -33,7 +33,7 @@ function modal(html) {
 const S = {
   user: null, profile: null, settingUp: false, tab: "pos", refresh: null, unsubs: [],
   settings: { rate: 0, round: 50, warnDays: 60, defaultMarkup: 25, pharmacy: "الصيدلية", adminPhone: "" },
-  products: [], cart: [], debts: [], cheques: [], users: [], todaySales: [], monthSales: [], month: ym(new Date()), askedRate: false
+  products: [], cart: (() => { try { return JSON.parse(localStorage.cart || "[]"); } catch { return []; } })(), debts: [], cheques: [], users: [], todaySales: [], monthSales: [], mineToday: [], mineMonth: [], myClosings: [], closings: [], selPh: null, month: ym(new Date()), askedRate: false
 };
 const isAdmin = () => S.profile?.role === "admin";
 const roundTo = v => { const r = Number(S.settings.round) || 1; return Math.round(v / r) * r; };
@@ -64,7 +64,7 @@ function showLogin() {
     try { await signInWithEmailAndPassword(auth, userEmail($("#lu").value), $("#lp").value); }
     catch { toast("اسم المستخدم أو كلمة المرور غير صحيحة"); }
   };
-  $("#lgo").onclick = go; $("#lp").onkeydown = e => e.key === "Enter" && go();
+  $("#lgo").onclick = go; $("#lp").onkeydown = e => { if (e.key === "Enter") go(); };
   $("#first").onclick = e => { e.preventDefault(); showSetup(); };
 }
 function showSetup() {
@@ -101,16 +101,31 @@ function startListeners() {
     S.settings = { ...S.settings, ...(s.data() || {}) };
     $("#rateBadge") && ($("#rateBadge").textContent = S.settings.rate ? `1$ = ${nf(S.settings.rate)} ج` : "⚠ أدخل سعر الدولار");
     $("#phName") && ($("#phName").textContent = "💊 " + S.settings.pharmacy);
-    S.refresh?.(); maybeAskRate();
+    S.refresh?.(); maybeAskRate(); flushMail();
   });
   on(query(collection(db, "products"), orderBy("name")), s => { S.products = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
+  if (!isAdmin()) {
+    const uid = S.user.uid, now = new Date();
+    const pick = s => s.docs.map(d => ({ id: d.id, ...d.data() }));
+    on(query(collection(db, "sales"), where("cashierUid", "==", uid), where("day", "==", ymd(now))), s => { S.mineToday = pick(s); S.refresh?.(); });
+    on(query(collection(db, "sales"), where("cashierUid", "==", uid), where("month", "==", ym(now))), s => { S.mineMonth = pick(s); S.refresh?.(); });
+    on(query(collection(db, "closings"), where("uid", "==", uid), where("day", "==", ymd(now))), s => { S.myClosings = pick(s); S.refresh?.(); });
+  }
   if (isAdmin()) {
     on(collection(db, "debts"), s => { S.debts = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
     on(collection(db, "cheques"), s => { S.cheques = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
     on(collection(db, "users"), s => { S.users = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
+    on(query(collection(db, "closings"), orderBy("closedAt", "desc"), limit(60)), s => { S.closings = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
     const t0 = new Date(); t0.setHours(0, 0, 0, 0);
-    on(query(collection(db, "sales"), where("createdAt", ">=", t0), orderBy("createdAt", "desc")), s => { S.todaySales = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
+    let seenFirst = false;
+    on(query(collection(db, "sales"), where("createdAt", ">=", t0), orderBy("createdAt", "desc")), s => {
+      if (seenFirst && !s.metadata.fromCache) s.docChanges().forEach(ch => { const d = ch.doc; if (ch.type === "added" && !d.metadata.hasPendingWrites && Date.now() - toDate(d.data().createdAt).getTime() < 180000) notifySale({ id: d.id, ...d.data() }); });
+      if (!s.metadata.fromCache) seenFirst = true;
+      S.todaySales = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.();
+    });
     listenMonth();
+    setTimeout(() => autoBackup(), 20000);
+    const iv = setInterval(() => autoBackup(), 30 * 60 * 1000); S.unsubs.push(() => clearInterval(iv));
   }
 }
 let monthUnsub = null;
@@ -127,20 +142,94 @@ function maybeAskRate() {
   S.askedRate = true; rateModal(true);
 }
 
+/* ============ إشعار مبيعات لحظي ============ */
+function notifySale(s) {
+  if (localStorage.notif !== "1") return;
+  const txt = `${s.cashier}: ${nf(s.total)} ج • ${s.items.length} صنف${s.pay === "credit" ? " (آجل)" : ""}`;
+  toast("🔔 فاتورة جديدة — " + txt); beep(); try { navigator.vibrate?.(200); } catch { }
+  if ("Notification" in window && Notification.permission === "granted") {
+    const opt = { body: `فاتورة ${s.no}\n${txt}`, icon: "icon.svg", tag: s.no, dir: "rtl", lang: "ar" };
+    navigator.serviceWorker?.getRegistration().then(r => r ? r.showNotification("🧾 " + S.settings.pharmacy, opt) : new Notification("🧾 " + S.settings.pharmacy, opt)).catch(() => { });
+  }
+}
+
+/* ============ إيميل تلقائي لكل فاتورة (Google Apps Script) ============ */
+const mailQ = () => { try { return JSON.parse(localStorage.mailq || "[]"); } catch { return []; } };
+const mailPost = (hook, key, subject, html, attach) => fetch(hook, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ key, subject, html, attach }) });
+let mailBusy = false;
+async function flushMail() {
+  if (mailBusy || !S.settings.emailHook) return; mailBusy = true;
+  try {
+    const q = mailQ();
+    while (q.length) { await mailPost(S.settings.emailHook, S.settings.emailKey || "", q[0].subject, q[0].html, q[0].attach); q.shift(); localStorage.mailq = JSON.stringify(q); }
+  } catch { } finally { mailBusy = false; }
+}
+function emailSale(s) {
+  if (!S.settings.emailHook) return;
+  const d = toDate(s.at || s.createdAt);
+  const rows = s.items.map(i => `<tr><td>${esc(i.name)}</td><td>${i.qty}</td><td>${nf(i.price)}</td><td>${nf(i.price * i.qty)}</td></tr>`).join("");
+  const html = `<div dir="rtl" style="font-family:Tahoma,Arial;max-width:520px"><h3>🧾 فاتورة ${esc(s.no)} — ${esc(S.settings.pharmacy)}</h3><p>${fmtTime(d)} • الصيدلي: ${esc(s.cashier)}</p><table border="1" cellpadding="6" style="border-collapse:collapse;width:100%"><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>المجموع</th></tr>${rows}</table><p>${s.discount ? "الخصم: " + nf(s.discount) + " ج<br>" : ""}<b>الإجمالي: ${nf(s.total)} ج</b> (${(s.total / s.rate).toFixed(2)}$)<br>سعر الدولار: ${nf(s.rate)}<br>الدفع: ${s.pay === "credit" ? "آجل — " + esc(s.customer) : "نقدي"}<br>📈 الربح: ${nf(s.profit)} ج</p></div>`;
+  localStorage.mailq = JSON.stringify([...mailQ(), { subject: `🧾 فاتورة ${s.no} — ${nf(s.total)} ج`, html }]);
+  flushMail();
+}
+window.addEventListener("online", flushMail);
+function queueMail(subject, html) {
+  if (!S.settings.emailHook) return false;
+  localStorage.mailq = JSON.stringify([...mailQ(), { subject, html }]);
+  flushMail(); return true;
+}
+
+/* ============ نسخ احتياطي ============ */
+const backupData = () => ({
+  app: "pharmacy-backup", at: new Date().toISOString(), pharmacy: S.settings.pharmacy, rate: S.settings.rate,
+  products: S.products, debts: S.debts, cheques: S.cheques,
+  users: S.users.map(u => ({ id: u.id, name: u.name, username: u.username, role: u.role, disabled: !!u.disabled })),
+  month: S.month, salesMonth: S.monthSales, closings: S.closings
+});
+function downloadBackup() {
+  const blob = new Blob([JSON.stringify(backupData())], { type: "application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `backup-${ymd(new Date())}.json`;
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+async function autoBackup(force) {
+  if (!isAdmin() || !S.settings.emailHook) return false;
+  if (!force) { if (Date.now() - Number(localStorage.lastBackup || 0) < 22 * 3600e3) return false; if (!S.products.length && !S.monthSales.length) return false; }
+  try {
+    await mailPost(S.settings.emailHook, S.settings.emailKey || "", `💾 نسخة احتياطية — ${S.settings.pharmacy} — ${ymd(new Date())}`,
+      `<div dir="rtl" style="font-family:Tahoma,Arial"><h3>💾 نسخة احتياطية تلقائية</h3><p>المرفق ملف JSON فيه الأصناف والديون والشيكات وفواتير الشهر. احتفظ به.<br>${fmtTime(new Date())}</p></div>`,
+      { name: `pharmacy-backup-${ymd(new Date())}.json`, data: JSON.stringify(backupData()) });
+    localStorage.lastBackup = String(Date.now()); return true;
+  } catch { return false; }
+}
+
 /* ============ الهيكل ============ */
 function showApp() {
   const tabs = [["pos", "🛒 الكاشير"], ["products", "📦 الأصناف"]];
-  if (isAdmin()) tabs.push(["dash", "📊 اللوحة"], ["debts", "💳 ديون وشيكات"], ["settings", "⚙ الإعدادات"]);
+  if (isAdmin()) tabs.push(["dash", "📊 اللوحة"], ["ph", "👥 الصيادلة"], ["debts", "💳 ديون وشيكات"], ["settings", "⚙ الإعدادات"]); else tabs.push(["mine", "💼 مبيعاتي"]);
   $("#root").innerHTML = `<header><h1 id="phName">💊 ${esc(S.settings.pharmacy)}</h1>
   <span class="badge" id="rateBadge">${S.settings.rate ? `1$ = ${nf(S.settings.rate)} ج` : "⚠ أدخل سعر الدولار"}</span>
-  <button class="btn sec sm" id="prBtn">🖨 ${esc(localStorage.printerName || "طابعة")}</button>
-  <span class="badge">${esc(S.profile.name)}</span><button class="btn sec sm" id="out">خروج</button></header>
+  ${isAdmin() ? `<button class="btn sec sm" id="bell"></button>` : ""}<button class="btn sec sm" id="prBtn">🖨 ${esc(localStorage.printerName || "طابعة")}</button>
+  <span class="badge">${esc(S.profile.name)}</span><span class="badge hide" id="net" style="background:#c62828">🔴 بدون إنترنت — الفواتير تُحفظ وتُرسل لاحقاً</span><button class="btn sec sm" id="out">خروج</button></header>
   <nav>${tabs.map(([k, l]) => `<button data-t="${k}" class="${k === S.tab ? "on" : ""}">${l}</button>`).join("")}</nav><main id="main"></main>`;
-  $("#out").onclick = () => signOut(auth);
+  $("#out").onclick = () => { S.cart = []; try { localStorage.cart = "[]"; } catch { } signOut(auth); };
+  const net = () => $("#net")?.classList.toggle("hide", navigator.onLine); window.ononline = net; window.onoffline = net; net();
+  if (isAdmin()) {
+    const bl = $("#bell"), paint = () => bl.textContent = localStorage.notif === "1" ? "🔔" : "🔕";
+    paint();
+    bl.onclick = async () => {
+      if (localStorage.notif === "1") { localStorage.notif = "0"; toast("تم إيقاف إشعارات المبيعات"); }
+      else {
+        localStorage.notif = "1"; beep();
+        if ("Notification" in window && Notification.permission === "default") { try { await Notification.requestPermission(); } catch { } }
+        toast("Notification" in window && Notification.permission === "granted" ? "تم تفعيل إشعارات المبيعات" : "تم التفعيل داخل التطبيق فقط (إشعارات الجهاز غير مسموحة)");
+      }
+      paint();
+    };
+  }
   $("#prBtn").onclick = async () => { try { await connectPrinter(); toast("تم الاتصال بالطابعة"); } catch (e) { toast(e.message || "فشل الاتصال"); } };
   if (isAdmin()) $("#rateBadge").onclick = () => rateModal(false);
   document.querySelectorAll("nav button").forEach(b => b.onclick = () => { S.tab = b.dataset.t; showApp(); });
-  ({ pos: viewPOS, products: viewProducts, dash: viewDash, debts: viewDebts, settings: viewSettings })[S.tab]();
+  (({ pos: viewPOS, products: viewProducts, dash: viewDash, ph: viewPharm, mine: viewMine, debts: viewDebts, settings: viewSettings })[S.tab] || viewPOS)();
 }
 
 /* ============ سعر الدولار ============ */
@@ -193,6 +282,7 @@ function viewPOS() {
     $("#cart").querySelectorAll("[data-m]").forEach(b => b.onclick = () => { const c = S.cart.find(x => x.id === b.dataset.m); if (--c.qty <= 0) S.cart = S.cart.filter(x => x !== c); cart(); });
     $("#cart").querySelectorAll("[data-p]").forEach(b => b.onclick = () => { S.cart.find(x => x.id === b.dataset.p).qty++; cart(); });
     $("#tot").textContent = nf(cartTotals().total) + " ج";
+    try { localStorage.cart = JSON.stringify(S.cart); } catch { }
   };
   q.oninput = results;
   q.onkeydown = e => {
@@ -220,7 +310,7 @@ function checkout() {
   if (pay === "credit" && !$("#cn").value.trim()) return toast("اكتب اسم العميل للبيع الآجل");
   const now = new Date();
   const no = `${ymd(now).replace(/-/g, "").slice(2)}-${pad2(now.getHours())}${pad2(now.getMinutes())}${Math.floor(Math.random() * 90 + 10)}`;
-  const sale = { no, items, subtotal, discount, total, cost, profit: total - cost, rate, pay, customer: pay === "credit" ? $("#cn").value.trim() : "", phone: pay === "credit" ? $("#cph").value.replace(/\D/g, "") : "", cashier: S.profile.name, cashierUid: S.user.uid, day: ymd(now) };
+  const sale = { no, items, subtotal, discount, total, cost, profit: total - cost, rate, pay, customer: pay === "credit" ? $("#cn").value.trim() : "", phone: pay === "credit" ? $("#cph").value.replace(/\D/g, "") : "", cashier: S.profile.name, cashierUid: S.user.uid, day: ymd(now), month: ym(now) };
   const ref = doc(collection(db, "sales")), b = writeBatch(db);
   b.set(ref, { ...sale, createdAt: serverTimestamp() });
   items.forEach(i => b.update(doc(db, "products", i.id), { qty: increment(-i.qty) }));
@@ -241,8 +331,18 @@ const waLink = (phone, text) => `https://wa.me/${String(phone || "").replace(/\D
 function showReceipt(sale, autoPrint) {
   const c = receiptCanvas(sale);
   const m = modal(`<h3>🧾 فاتورة ${esc(sale.no)}</h3><img class="rcpt" src="${c.toDataURL()}" style="width:260px">
-  <div class="row" style="flex-wrap:wrap"><button class="btn" id="rp">🖨 طباعة بلوتوث</button><button class="btn wa" id="rw">واتساب للمدير</button><button class="btn sec" id="rn">طباعة عادية</button><button class="btn sec" id="rx">إغلاق</button></div>`);
+  <div class="row" style="flex-wrap:wrap"><button class="btn" id="rp">🖨 طباعة بلوتوث</button><button class="btn wa" id="rw">واتساب للمدير</button><button class="btn sec" id="rn">طباعة عادية</button>${isAdmin() && sale.id ? `<button class="btn danger" id="rd">🗑 حذف الفاتورة</button>` : ""}<button class="btn sec" id="rx">إغلاق</button></div>`);
   $("#rx", m).onclick = m.close;
+  $("#rd", m) && ($("#rd", m).onclick = async () => {
+    if (!confirm("حذف الفاتورة نهائياً وإرجاع كمياتها للمخزون؟")) return;
+    try {
+      const b = writeBatch(db);
+      b.delete(doc(db, "sales", sale.id));
+      sale.items.filter(i => S.products.some(p => p.id === i.id)).forEach(i => b.update(doc(db, "products", i.id), { qty: increment(i.qty) }));
+      S.debts.filter(d => d.saleNo === sale.no && !d.paid).forEach(d => b.delete(doc(db, "debts", d.id)));
+      await b.commit(); m.close(); toast("تم حذف الفاتورة");
+    } catch (e) { toast("تعذر الحذف: " + e.message); }
+  });
   $("#rp", m).onclick = () => printReceipt(sale);
   $("#rw", m).onclick = () => window.open(waLink(S.settings.adminPhone, waText(sale)), "_blank");
   $("#rn", m).onclick = () => { const w = window.open(""); w.document.write(`<img src="${c.toDataURL()}" style="width:300px" onload="print()">`); };
@@ -419,6 +519,78 @@ function alerts() {
   return out;
 }
 
+/* ============ إقفال حساب الصيدلي ============ */
+async function closeShift() {
+  const last = Math.max(0, ...S.myClosings.map(c => toDate(c.closedAt).getTime()));
+  const list = S.mineToday.filter(s => toDate(s.createdAt).getTime() > last).sort((a, b) => toDate(a.createdAt) - toDate(b.createdAt));
+  if (!list.length) return toast("لا فواتير جديدة منذ آخر إقفال");
+  const t = sumSales(list), credit = list.filter(s => s.pay === "credit").reduce((a, s) => a + s.total, 0), cash = t.total - credit, now = new Date();
+  if (!confirm(`إقفال الحساب: ${t.n} فاتورة بإجمالي ${nf(t.total)} ج (نقدي ${nf(cash)} • آجل ${nf(credit)}). سيُرسل التقرير للمدير. متابعة؟`)) return;
+  addDoc(collection(db, "closings"), { uid: S.user.uid, name: S.profile.name, day: ymd(now), count: t.n, total: t.total, profit: t.profit, cash, credit, closedAt: serverTimestamp() }).catch(e => toast("تعذر الحفظ: " + e.message));
+  const tb = `<table border="1" cellpadding="6" style="border-collapse:collapse;width:100%">`;
+  const rows = list.map((s, i) => `<tr><td>${i + 1}</td><td>${esc(s.no)}</td><td>${fmtTime(toDate(s.createdAt)).slice(11)}</td><td>${s.items.map(x => `${esc(x.name)} ×${x.qty}`).join("، ")}</td><td>${s.pay === "credit" ? "آجل — " + esc(s.customer) : "نقدي"}</td><td>${nf(s.total)}</td></tr>`).join("");
+  const html = `<div dir="rtl" style="font-family:Tahoma,Arial;max-width:680px"><h2>🔒 إقفال حساب — ${esc(S.profile.name)}</h2><p>${esc(S.settings.pharmacy)} • ${fmtTime(now)}<br>الفواتير من ${fmtTime(toDate(list[0].createdAt)).slice(11)} إلى ${fmtTime(toDate(list[list.length - 1].createdAt)).slice(11)}</p>
+<p>عدد الفواتير: <b>${t.n}</b><br>إجمالي الإيراد: <b>${nf(t.total)} ج</b><br>نقدي: ${nf(cash)} ج • آجل: ${nf(credit)} ج<br>سعر الدولار: ${nf(S.settings.rate)}<br>📈 الربح: ${nf(t.profit)} ج</p>
+${tb}<tr><th>#</th><th>الفاتورة</th><th>الوقت</th><th>الأصناف</th><th>الدفع</th><th>المبلغ</th></tr>${rows}</table><h3>الأصناف المباعة</h3>${aggItems(list).replace("<table>", tb)}</div>`;
+  toast(queueMail(`🔒 إقفال ${S.profile.name} — ${nf(t.total)} ج (${t.n} فاتورة)`, html) ? "تم الإقفال وإرسال التقرير للمدير" : "تم الإقفال (الإيميل غير مفعّل في الإعدادات)");
+}
+
+/* ============ صفحات مبيعات الصيادلة ============ */
+const statHtml = (l, v) => `<div class="stat"><span>${l}</span><b>${v}</b></div>`;
+function aggItems(list) {
+  const m = new Map();
+  list.forEach(s => s.items.forEach(i => { const k = i.id || i.name, r = m.get(k) || { name: i.name, qty: 0, sum: 0 }; r.qty += i.qty; r.sum += i.price * i.qty; m.set(k, r); }));
+  const rows = [...m.values()].sort((a, b) => b.qty - a.qty).slice(0, 60);
+  return rows.length ? `<table><tr><th>الصنف</th><th>الكمية</th><th>المبلغ (ج)</th></tr>${rows.map(r => `<tr><td>${esc(r.name)}</td><td>${r.qty}</td><td>${nf(r.sum)}</td></tr>`).join("")}</table>` : `<p style="text-align:center;color:var(--mut)">لا مبيعات</p>`;
+}
+function invRow(s) {
+  return `<div data-id="${s.id}"><span>${esc(s.no)} <small>${fmtTime(toDate(s.createdAt))} • ${s.items.length} صنف${s.pay === "credit" ? " • آجل" : ""}</small><small style="color:var(--tx);white-space:normal">${s.items.map(i => `${esc(i.name)} ×${i.qty}`).join(" ، ")}</small></span><b>${nf(s.total)} ج</b></div>`;
+}
+function viewMine() {
+  $("#main").innerHTML = `<div class="card"><button class="btn big" id="cls">🔒 إقفال حسابي وإرسال التقرير للمدير</button><p id="clsi" style="font-size:13px;color:var(--mut);text-align:center;margin:6px 0 0"></p></div>
+  <div class="card"><h3>💼 مبيعاتي اليوم — ${esc(S.profile.name)}</h3><div class="grid" id="mt"></div></div>
+  <div class="card"><h3>📅 هذا الشهر</h3><div class="grid" id="mm"></div></div>
+  <div class="card"><h3>فواتيري اليوم</h3><div id="ml" class="list"></div></div>
+  <div class="card"><h3>الأصناف التي بعتها اليوم</h3><div id="ma"></div></div>`;
+  $("#cls").onclick = closeShift;
+  S.refresh = () => {
+    const t = sumSales(S.mineToday), m = sumSales(S.mineMonth);
+    const lc = S.myClosings.map(c => toDate(c.closedAt).getTime()).sort((a, b) => b - a)[0];
+    $("#clsi").textContent = lc ? "آخر إقفال اليوم: " + fmtTime(new Date(lc)).slice(11) : "لم تُقفل حسابك اليوم بعد";
+    $("#mt").innerHTML = statHtml("إيراد اليوم", nf(t.total) + " ج") + statHtml("فواتير اليوم", t.n);
+    $("#mm").innerHTML = statHtml("إيراد الشهر", nf(m.total) + " ج") + statHtml("فواتير الشهر", m.n);
+    const l = [...S.mineToday].sort((a, b) => toDate(b.createdAt) - toDate(a.createdAt));
+    $("#ml").innerHTML = l.map(invRow).join("") || `<p style="text-align:center;color:var(--mut)">لا فواتير بعد</p>`;
+    $("#ml").querySelectorAll("[data-id]").forEach(d => d.onclick = () => showReceipt(l.find(s => s.id === d.dataset.id)));
+    $("#ma").innerHTML = aggItems(S.mineToday);
+  };
+  S.refresh();
+}
+function viewPharm() {
+  $("#main").innerHTML = `<div class="row" style="margin-bottom:8px"><h3 style="flex:1;margin:0">👥 مبيعات الصيادلة</h3><input type="month" id="pm" value="${S.month}" style="max-width:170px"></div><div id="pc"></div>
+  <div class="card"><h3>🔒 آخر الإقفالات</h3><div id="pcl" class="list"></div></div>
+  <div class="card"><h3 id="pa">الأصناف المباعة</h3><div id="pal"></div></div>
+  <div class="card"><h3 id="pt">الفواتير</h3><div id="pl2" class="list"></div></div>`;
+  $("#pm").onchange = e => { S.month = e.target.value || ym(new Date()); listenMonth(); };
+  S.refresh = () => {
+    if (!S.selPh || !S.users.some(u => u.id === S.selPh)) S.selPh = (S.users.find(u => u.role !== "admin") || S.users[0])?.id || null;
+    $("#pc").innerHTML = S.users.map(u => {
+      const t = sumSales(S.todaySales.filter(s => s.cashierUid === u.id)), m = sumSales(S.monthSales.filter(s => s.cashierUid === u.id));
+      return `<div class="card" data-u="${u.id}" style="cursor:pointer;${u.id === S.selPh ? "border:2px solid var(--p)" : ""}"><h3>${esc(u.name)} <span class="tag ${u.disabled ? "red" : ""}">${u.disabled ? "موقوف" : u.role === "admin" ? "مدير" : "صيدلي"}</span></h3>
+      <table><tr><th></th><th>فواتير</th><th>الإيراد (ج)</th><th>الربح (ج)</th></tr><tr><td>اليوم</td><td>${t.n}</td><td>${nf(t.total)}</td><td>${nf(t.profit)}</td></tr><tr><td>الشهر</td><td>${m.n}</td><td>${nf(m.total)}</td><td>${nf(m.profit)}</td></tr></table></div>`;
+    }).join("") || `<p style="text-align:center;color:var(--mut)">لا حسابات</p>`;
+    $("#pc").querySelectorAll("[data-u]").forEach(d => d.onclick = () => { S.selPh = d.dataset.u; S.refresh(); });
+    $("#pcl").innerHTML = S.closings.slice(0, 20).map(c => `<div style="cursor:default"><span>${esc(c.name)} <small>${fmtTime(toDate(c.closedAt))} • ${c.count} فاتورة • نقدي ${nf(c.cash)} • آجل ${nf(c.credit)}</small></span><b>${nf(c.total)} ج</b></div>`).join("") || `<p style="text-align:center;color:var(--mut)">لا إقفالات بعد</p>`;
+    const u = S.users.find(x => x.id === S.selPh), l = S.monthSales.filter(s => s.cashierUid === S.selPh).slice(0, 150);
+    $("#pt").textContent = `فواتير ${u ? u.name : ""} — ${S.month}`;
+    $("#pa").textContent = `الأصناف التي باعها ${u ? u.name : ""} — ${S.month}`;
+    $("#pal").innerHTML = aggItems(S.monthSales.filter(s => s.cashierUid === S.selPh));
+    $("#pl2").innerHTML = l.map(invRow).join("") || `<p style="text-align:center;color:var(--mut)">لا فواتير</p>`;
+    $("#pl2").querySelectorAll("[data-id]").forEach(d => d.onclick = () => showReceipt(l.find(s => s.id === d.dataset.id)));
+  };
+  S.refresh();
+}
+
 /* ============ ديون وشيكات ============ */
 function viewDebts() {
   $("#main").innerHTML = `<div class="card"><div class="row"><h3 style="flex:1;margin:0">💳 المديونيات</h3><button class="btn sm" id="da">+ دين</button></div><div id="dl" class="list"></div></div>
@@ -459,11 +631,23 @@ function viewSettings() {
   <label>واتساب المدير (مع كود الدولة)</label><input id="s2" inputmode="tel" value="${esc(S.settings.adminPhone)}">
   <div class="row"><div><label>تنبيه الانتهاء قبل (يوم)</label><input id="s3" type="number" value="${S.settings.warnDays}"></div><div><label>تقريب السعر إلى أقرب</label><input id="s4" type="number" value="${S.settings.round}"></div></div>
   <div class="row"><div><label>نسبة الربح الافتراضية %</label><input id="s6" type="number" step="0.1" inputmode="decimal" value="${S.settings.defaultMarkup ?? 25}"></div><button class="btn sec" id="sap" style="align-self:flex-end">تطبيق على كل الأصناف</button></div>
+  <label>رابط سكربت الإيميل (Google Apps Script) — اتركه فارغاً لإيقاف الإيميل</label><input id="s7" placeholder="https://script.google.com/macros/s/.../exec" value="${esc(S.settings.emailHook)}">
+  <label>كلمة سر الإيميل (نفس الموجودة في السكربت)</label><input id="s8" value="${esc(S.settings.emailKey)}">
+  <button class="btn sec sm" id="smt" style="margin-top:8px">📧 إرسال إيميل تجريبي</button>
+  <div class="row" style="margin-top:8px"><button class="btn sec sm" id="bkd">💾 تنزيل نسخة احتياطية</button><button class="btn sec sm" id="bke">📧 إرسال نسخة بالإيميل الآن</button></div>
+  <p style="font-size:12px;color:var(--mut);margin:6px 0 0">تُرسل نسخة تلقائية كل يوم إلى بريدك عند فتح التطبيق بحساب المدير.</p>
   <label>عرض ورق الطابعة (على هذا الجهاز)</label><select id="s5"><option value="384" ${localStorage.paper !== "576" ? "selected" : ""}>58 مم</option><option value="576" ${localStorage.paper === "576" ? "selected" : ""}>80 مم</option></select>
   <div style="height:10px"></div><button class="btn" id="ss">حفظ</button></div>
   <div class="card"><div class="row"><h3 style="flex:1;margin:0">👥 الحسابات</h3><button class="btn sm" id="ua">+ صيدلي</button></div><div id="ul" class="list"></div></div>`;
-  $("#ss").onclick = async () => { localStorage.paper = $("#s5").value; await setDoc(doc(db, "settings", "main"), { pharmacy: $("#s1").value.trim(), adminPhone: $("#s2").value.replace(/\D/g, ""), warnDays: Number($("#s3").value) || 60, round: Number($("#s4").value) || 1, defaultMarkup: Number($("#s6").value) || 0 }, { merge: true }); toast("تم الحفظ"); };
+  $("#ss").onclick = async () => { localStorage.paper = $("#s5").value; await setDoc(doc(db, "settings", "main"), { pharmacy: $("#s1").value.trim(), adminPhone: $("#s2").value.replace(/\D/g, ""), warnDays: Number($("#s3").value) || 60, round: Number($("#s4").value) || 1, defaultMarkup: Number($("#s6").value) || 0, emailHook: $("#s7").value.trim(), emailKey: $("#s8").value.trim() }, { merge: true }); toast("تم الحفظ"); };
   $("#ua").onclick = userModal;
+  $("#bkd").onclick = downloadBackup;
+  $("#bke").onclick = async () => toast((await autoBackup(true)) ? "أُرسلت النسخة — افحص بريدك" : "تعذر الإرسال — تحقق من رابط السكربت والإنترنت");
+  $("#smt").onclick = async () => {
+    const h = $("#s7").value.trim(); if (!h) return toast("الصق رابط السكربت أولاً");
+    try { await mailPost(h, $("#s8").value.trim(), "📧 إيميل تجريبي — " + S.settings.pharmacy, `<div dir="rtl"><h3>الإيميل يعمل ✔</h3><p>${fmtTime(new Date())}</p></div>`); toast("أُرسل الطلب — افحص بريدك خلال دقيقة (وصندوق الرسائل غير المرغوبة)"); }
+    catch { toast("تعذر الوصول للرابط — تأكد من الإنترنت ومن الرابط"); }
+  };
   $("#sap").onclick = async () => {
     const mk = Number($("#s6").value);
     if (!(mk >= 0)) return toast("اكتب نسبة صحيحة");
