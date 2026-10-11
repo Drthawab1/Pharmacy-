@@ -1,9 +1,9 @@
 // الصق هنا إعدادات مشروعك من Firebase Console ← Project settings ← Your apps ← Web app
 export const firebaseConfig = {
-  apiKey: "PASTE_HERE",
-  authDomain: "PASTE_HERE.firebaseapp.com",
-  projectId: "PASTE_HERE",
-  storageBucket: "PASTE_HERE.appspot.com",
-  messagingSenderId: "PASTE_HERE",
-  appId: "PASTE_HERE"
+  apiKey: "AIzaSyBuBirTRgUUl9t0aJvyhssf3QYaDLmj228",
+  authDomain: "ronza-pharmacy.firebaseapp.com",
+  projectId: "ronza-pharmacy",
+  storageBucket: "ronza-pharmacy.appspot.com",
+  messagingSenderId: "26385729177",
+  appId: "1:26385729177:web:608bb9e700aa2c77669a08"
 };
