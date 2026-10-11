@@ -32,12 +32,25 @@ function modal(html) {
 
 const S = {
   user: null, profile: null, settingUp: false, tab: "pos", refresh: null, unsubs: [],
-  settings: { rate: 0, round: 50, warnDays: 60, defaultMarkup: 25, pharmacy: "الصيدلية", adminPhone: "" },
+  settings: { rate: 0, round: 50, warnDays: 60, chequeDays: 7, defaultMarkup: 25, markupMed: 25, markupCos: 25, markupDel: 25, pharmacy: "الصيدلية", adminPhone: "" },
   products: [], cart: (() => { try { return JSON.parse(localStorage.cart || "[]"); } catch { return []; } })(), debts: [], cheques: [], users: [], todaySales: [], monthSales: [], mineToday: [], mineMonth: [], myClosings: [], closings: [], selPh: null, month: ym(new Date()), askedRate: false
 };
 const isAdmin = () => S.profile?.role === "admin";
 const roundTo = v => { const r = Number(S.settings.round) || 1; return Math.round(v / r) * r; };
-const priceSDG = p => roundTo((Number(p.priceUSD) || 0) * (Number(S.settings.rate) || 0));
+/* الأقسام الثلاثة */
+const CATS = { med: { label: "أدوية", icon: "💊", key: "markupMed" }, cos: { label: "كوزمتك", icon: "💄", key: "markupCos" }, del: { label: "دليفري", icon: "🛵", key: "markupDel" } };
+const catOf = p => (p && CATS[p.cat] ? p.cat : "med");
+const catMarkup = c => { const v = S.settings[CATS[c].key]; return v === undefined || v === null || v === "" ? Number(S.settings.defaultMarkup ?? 25) : Number(v); };
+const r2 = v => Math.round((Number(v) || 0) * 100) / 100;
+/* الإدخال بالجنيه ويُحفظ مقابله بالدولار بسعر يوم الإدخال؛ سعر البيع = الدولار × سعر اليوم فيتحرك مع تغيّر الدولار */
+const p6 = v => Math.round((Number(v) || 0) * 1e6) / 1e6;
+const priceSDG = p => (Number(p.priceUSD) > 0 && Number(S.settings.rate) > 0) ? roundTo(Number(p.priceUSD) * Number(S.settings.rate)) : (Number(p.priceSDG) || 0);
+const costOf = p => (Number(p.costUSD) > 0 && Number(S.settings.rate) > 0) ? Number(p.costUSD) * Number(S.settings.rate) : (Number(p.costSDG) || 0);
+const toUSD = v => (Number(S.settings.rate) > 0 ? (Number(v) || 0) / Number(S.settings.rate) : 0);
+const payTxt = s => s.pay === "credit" ? "آجل — " + (s.customer || "") : s.pay === "transfer" ? "تحويل" + (s.ref ? " (" + s.ref + ")" : "") : "نقدي";
+const dueTxt = x => x < 0 ? "متأخر " + -x + " يوم" : x === 0 ? "اليوم" : "بعد " + x + " يوم";
+function updBadge() { const b = $("#albadge"); if (!b) return; const n = alerts().length; b.textContent = n; b.style.display = n ? "" : "none"; }
+function ping() { S.refresh?.(); updBadge(); }
 
 /* ============ دخول ============ */
 onAuthStateChanged(auth, async u => {
@@ -46,7 +59,7 @@ onAuthStateChanged(auth, async u => {
   if (!u) return showLogin();
   await enter(u);
 });
-function cleanup() { S.unsubs.forEach(f => f()); S.unsubs = []; S.askedRate = false; }
+function cleanup() { S.unsubs.forEach(f => f()); S.unsubs = []; S.askedRate = false; S.tab = "pos"; S.refresh = null; }
 async function enter(u) {
   const ps = await getDoc(doc(db, "users", u.uid)).catch(() => null);
   if (!ps || !ps.exists() || ps.data().disabled) { toast("الحساب غير مفعّل أو غير موجود"); await signOut(auth); return; }
@@ -55,7 +68,7 @@ async function enter(u) {
 }
 
 function showLogin() {
-  $("#root").innerHTML = `<div class="login"><h2>💊 كاشير الصيدلية</h2>
+  $("#root").innerHTML = `<div class="login"><img src="logo.png" alt="Ronza Medical Company" style="display:block;width:230px;max-width:80%;margin:0 auto 10px"><h2>كاشير الصيدلية</h2>
   <div class="card"><label>اسم المستخدم</label><input id="lu" autocomplete="username" autocapitalize="none">
   <label>كلمة المرور</label><input id="lp" type="password" autocomplete="current-password">
   <div style="height:12px"></div><button class="btn big" id="lgo">دخول</button>
@@ -68,7 +81,7 @@ function showLogin() {
   $("#first").onclick = e => { e.preventDefault(); showSetup(); };
 }
 function showSetup() {
-  $("#root").innerHTML = `<div class="login"><h2>إعداد أول مرة</h2><div class="card">
+  $("#root").innerHTML = `<div class="login"><img src="logo.png" alt="Ronza Medical Company" style="display:block;width:200px;max-width:70%;margin:0 auto 10px"><h2>إعداد أول مرة</h2><div class="card">
   <p style="font-size:14px;color:var(--mut)">أنشئ حساب المدير (أنت). يعمل هذا مرة واحدة فقط.</p>
   <label>اسم الصيدلية</label><input id="sn">
   <label>اسمك</label><input id="sa">
@@ -100,28 +113,28 @@ function startListeners() {
   on(doc(db, "settings", "main"), s => {
     S.settings = { ...S.settings, ...(s.data() || {}) };
     $("#rateBadge") && ($("#rateBadge").textContent = S.settings.rate ? `1$ = ${nf(S.settings.rate)} ج` : "⚠ أدخل سعر الدولار");
-    $("#phName") && ($("#phName").textContent = "💊 " + S.settings.pharmacy);
-    S.refresh?.(); maybeAskRate(); flushMail();
+    $("#phName") && ($("#phName").textContent = S.settings.pharmacy);
+    ping(); maybeAskRate(); flushMail();
   });
-  on(query(collection(db, "products"), orderBy("name")), s => { S.products = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
+  on(query(collection(db, "products"), orderBy("name")), s => { S.products = s.docs.map(d => ({ id: d.id, ...d.data() })); ping(); });
   if (!isAdmin()) {
     const uid = S.user.uid, now = new Date();
     const pick = s => s.docs.map(d => ({ id: d.id, ...d.data() }));
-    on(query(collection(db, "sales"), where("cashierUid", "==", uid), where("day", "==", ymd(now))), s => { S.mineToday = pick(s); S.refresh?.(); });
-    on(query(collection(db, "sales"), where("cashierUid", "==", uid), where("month", "==", ym(now))), s => { S.mineMonth = pick(s); S.refresh?.(); });
-    on(query(collection(db, "closings"), where("uid", "==", uid), where("day", "==", ymd(now))), s => { S.myClosings = pick(s); S.refresh?.(); });
+    on(query(collection(db, "sales"), where("cashierUid", "==", uid), where("day", "==", ymd(now))), s => { S.mineToday = pick(s); ping(); });
+    on(query(collection(db, "sales"), where("cashierUid", "==", uid), where("month", "==", ym(now))), s => { S.mineMonth = pick(s); ping(); });
+    on(query(collection(db, "closings"), where("uid", "==", uid), where("day", "==", ymd(now))), s => { S.myClosings = pick(s); ping(); });
   }
   if (isAdmin()) {
-    on(collection(db, "debts"), s => { S.debts = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
-    on(collection(db, "cheques"), s => { S.cheques = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
-    on(collection(db, "users"), s => { S.users = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
-    on(query(collection(db, "closings"), orderBy("closedAt", "desc"), limit(60)), s => { S.closings = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); });
+    on(collection(db, "debts"), s => { S.debts = s.docs.map(d => ({ id: d.id, ...d.data() })); ping(); });
+    on(collection(db, "cheques"), s => { S.cheques = s.docs.map(d => ({ id: d.id, ...d.data() })); ping(); });
+    on(collection(db, "users"), s => { S.users = s.docs.map(d => ({ id: d.id, ...d.data() })); ping(); });
+    on(query(collection(db, "closings"), orderBy("closedAt", "desc"), limit(60)), s => { S.closings = s.docs.map(d => ({ id: d.id, ...d.data() })); ping(); });
     const t0 = new Date(); t0.setHours(0, 0, 0, 0);
     let seenFirst = false;
     on(query(collection(db, "sales"), where("createdAt", ">=", t0), orderBy("createdAt", "desc")), s => {
       if (seenFirst && !s.metadata.fromCache) s.docChanges().forEach(ch => { const d = ch.doc; if (ch.type === "added" && !d.metadata.hasPendingWrites && Date.now() - toDate(d.data().createdAt).getTime() < 180000) notifySale({ id: d.id, ...d.data() }); });
       if (!s.metadata.fromCache) seenFirst = true;
-      S.todaySales = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.();
+      S.todaySales = s.docs.map(d => ({ id: d.id, ...d.data() })); ping();
     });
     listenMonth();
     setTimeout(() => autoBackup(), 20000);
@@ -132,7 +145,7 @@ let monthUnsub = null;
 function listenMonth() {
   monthUnsub?.(); const [y, m] = S.month.split("-").map(Number);
   monthUnsub = onSnapshot(query(collection(db, "sales"), where("createdAt", ">=", new Date(y, m - 1, 1)), where("createdAt", "<", new Date(y, m, 1)), orderBy("createdAt", "desc")),
-    s => { S.monthSales = s.docs.map(d => ({ id: d.id, ...d.data() })); S.refresh?.(); }, e => console.error(e));
+    s => { S.monthSales = s.docs.map(d => ({ id: d.id, ...d.data() })); ping(); }, e => console.error(e));
   S.unsubs.push(() => monthUnsub?.());
 }
 function maybeAskRate() {
@@ -145,10 +158,10 @@ function maybeAskRate() {
 /* ============ إشعار مبيعات لحظي ============ */
 function notifySale(s) {
   if (localStorage.notif !== "1") return;
-  const txt = `${s.cashier}: ${nf(s.total)} ج • ${s.items.length} صنف${s.pay === "credit" ? " (آجل)" : ""}`;
+  const txt = `${s.cashier}: ${nf(s.total)} ج • ${s.items.length} صنف${s.pay === "credit" ? " (آجل)" : s.pay === "transfer" ? " (تحويل)" : ""}`;
   toast("🔔 فاتورة جديدة — " + txt); beep(); try { navigator.vibrate?.(200); } catch { }
   if ("Notification" in window && Notification.permission === "granted") {
-    const opt = { body: `فاتورة ${s.no}\n${txt}`, icon: "icon.svg", tag: s.no, dir: "rtl", lang: "ar" };
+    const opt = { body: `فاتورة ${s.no}\n${txt}`, icon: "icon-192.png", tag: s.no, dir: "rtl", lang: "ar" };
     navigator.serviceWorker?.getRegistration().then(r => r ? r.showNotification("🧾 " + S.settings.pharmacy, opt) : new Notification("🧾 " + S.settings.pharmacy, opt)).catch(() => { });
   }
 }
@@ -168,7 +181,7 @@ function emailSale(s) {
   if (!S.settings.emailHook) return;
   const d = toDate(s.at || s.createdAt);
   const rows = s.items.map(i => `<tr><td>${esc(i.name)}</td><td>${i.qty}</td><td>${nf(i.price)}</td><td>${nf(i.price * i.qty)}</td></tr>`).join("");
-  const html = `<div dir="rtl" style="font-family:Tahoma,Arial;max-width:520px"><h3>🧾 فاتورة ${esc(s.no)} — ${esc(S.settings.pharmacy)}</h3><p>${fmtTime(d)} • الصيدلي: ${esc(s.cashier)}</p><table border="1" cellpadding="6" style="border-collapse:collapse;width:100%"><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>المجموع</th></tr>${rows}</table><p>${s.discount ? "الخصم: " + nf(s.discount) + " ج<br>" : ""}<b>الإجمالي: ${nf(s.total)} ج</b> (${(s.total / s.rate).toFixed(2)}$)<br>سعر الدولار: ${nf(s.rate)}<br>الدفع: ${s.pay === "credit" ? "آجل — " + esc(s.customer) : "نقدي"}<br>📈 الربح: ${nf(s.profit)} ج</p></div>`;
+  const html = `<div dir="rtl" style="font-family:Tahoma,Arial;max-width:520px"><h3>🧾 فاتورة ${esc(s.no)} — ${esc(S.settings.pharmacy)}</h3><p>${fmtTime(d)} • الصيدلي: ${esc(s.cashier)}</p><table border="1" cellpadding="6" style="border-collapse:collapse;width:100%"><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>المجموع</th></tr>${rows}</table><p>${s.discount ? "الخصم: " + nf(s.discount) + " ج<br>" : ""}<b>الإجمالي: ${nf(s.total)} ج</b> (${(s.total / s.rate).toFixed(2)}$)<br>سعر الدولار: ${nf(s.rate)}<br>الدفع: ${esc(payTxt(s))}<br>📈 الربح: ${nf(s.profit)} ج</p></div>`;
   localStorage.mailq = JSON.stringify([...mailQ(), { subject: `🧾 فاتورة ${s.no} — ${nf(s.total)} ج`, html }]);
   flushMail();
 }
@@ -204,13 +217,14 @@ async function autoBackup(force) {
 
 /* ============ الهيكل ============ */
 function showApp() {
-  const tabs = [["pos", "🛒 الكاشير"], ["products", "📦 الأصناف"]];
-  if (isAdmin()) tabs.push(["dash", "📊 اللوحة"], ["ph", "👥 الصيادلة"], ["debts", "💳 ديون وشيكات"], ["settings", "⚙ الإعدادات"]); else tabs.push(["mine", "💼 مبيعاتي"]);
-  $("#root").innerHTML = `<header><h1 id="phName">💊 ${esc(S.settings.pharmacy)}</h1>
+  const tabs = [["pos", "🛒 الكاشير"], ["med", "💊 أدوية"], ["cos", "💄 كوزمتك"], ["del", "🛵 دليفري"]];
+  if (isAdmin()) tabs.push(["dash", "📊 اللوحة"], ["ph", "👥 الصيادلة"], ["debts", "💳 ديون وشيكات"], ["alerts", "🔔 تنبيهات"], ["settings", "⚙ الإعدادات"]); else tabs.push(["mine", "💼 مبيعاتي"], ["alerts", "🔔 تنبيهات"]);
+  if (!tabs.some(t => t[0] === S.tab)) S.tab = "pos"; // الصيدلي لا يرى تبويب لا يملكه
+  $("#root").innerHTML = `<header><img src="logo-mark.png" alt="" style="height:30px;width:30px;background:#fff;border-radius:8px;padding:2px;object-fit:contain"><h1 id="phName">${esc(S.settings.pharmacy)}</h1>
   <span class="badge" id="rateBadge">${S.settings.rate ? `1$ = ${nf(S.settings.rate)} ج` : "⚠ أدخل سعر الدولار"}</span>
   ${isAdmin() ? `<button class="btn sec sm" id="bell"></button>` : ""}<button class="btn sec sm" id="prBtn">🖨 ${esc(localStorage.printerName || "طابعة")}</button>
   <span class="badge">${esc(S.profile.name)}</span><span class="badge hide" id="net" style="background:#c62828">🔴 بدون إنترنت — الفواتير تُحفظ وتُرسل لاحقاً</span><button class="btn sec sm" id="out">خروج</button></header>
-  <nav>${tabs.map(([k, l]) => `<button data-t="${k}" class="${k === S.tab ? "on" : ""}">${l}</button>`).join("")}</nav><main id="main"></main>`;
+  <nav>${tabs.map(([k, l]) => `<button data-t="${k}" class="${k === S.tab ? "on" : ""}">${l}${k === "alerts" ? `<span id="albadge" style="background:#c62828;color:#fff;border-radius:10px;padding:0 6px;font-size:11px;margin-right:4px;display:none"></span>` : ""}</button>`).join("")}</nav><main id="main"></main>`;
   $("#out").onclick = () => { S.cart = []; try { localStorage.cart = "[]"; } catch { } signOut(auth); };
   const net = () => $("#net")?.classList.toggle("hide", navigator.onLine); window.ononline = net; window.onoffline = net; net();
   if (isAdmin()) {
@@ -229,7 +243,8 @@ function showApp() {
   $("#prBtn").onclick = async () => { try { await connectPrinter(); toast("تم الاتصال بالطابعة"); } catch (e) { toast(e.message || "فشل الاتصال"); } };
   if (isAdmin()) $("#rateBadge").onclick = () => rateModal(false);
   document.querySelectorAll("nav button").forEach(b => b.onclick = () => { S.tab = b.dataset.t; showApp(); });
-  (({ pos: viewPOS, products: viewProducts, dash: viewDash, ph: viewPharm, mine: viewMine, debts: viewDebts, settings: viewSettings })[S.tab] || viewPOS)();
+  updBadge();
+  (({ pos: viewPOS, med: () => viewProducts("med"), cos: () => viewProducts("cos"), del: () => viewProducts("del"), dash: viewDash, ph: viewPharm, mine: viewMine, debts: viewDebts, alerts: viewAlerts, settings: viewSettings })[S.tab] || viewPOS)();
 }
 
 /* ============ سعر الدولار ============ */
@@ -248,10 +263,11 @@ function rateModal(auto) {
 
 /* ============ الكاشير ============ */
 function viewPOS() {
-  $("#main").innerHTML = `<div class="pos"><section class="card"><div class="row"><input id="q" placeholder="ابحث بالاسم أو امسح الباركود" autocomplete="off"><button class="btn" id="cam">📷</button></div><div id="res" class="list" style="margin-top:6px"></div></section>
+  $("#main").innerHTML = `<div class="pos"><section class="card"><div class="row"><input id="q" placeholder="ابحث في الأدوية والكوزمتك والدليفري أو امسح الباركود" autocomplete="off"><button class="btn" id="cam">📷</button></div><div id="res" class="list" style="margin-top:6px"></div></section>
   <section class="card"><h3>الفاتورة</h3><div id="cart"></div>
   <div class="row"><div><label>خصم (ج)</label><input id="disc" type="number" inputmode="decimal" value="0"></div>
-  <div><label>الدفع</label><select id="pay"><option value="cash">نقدي</option><option value="credit">آجل (دين)</option></select></div></div>
+  <div><label>الدفع</label><select id="pay"><option value="transfer">تحويل</option><option value="cash">نقدي</option><option value="credit">آجل (دين)</option></select></div></div>
+  <div id="refBox"><label>رقم / مرجع التحويل (اختياري)</label><input id="rf"></div>
   <div id="creditBox" class="hide"><label>اسم العميل</label><input id="cn"><label>هاتف العميل</label><input id="cph" inputmode="tel"><label>تاريخ السداد</label><input id="cd" type="date"></div>
   <div class="total" id="tot">0 ج</div><button class="btn big" id="co">✔ إتمام البيع وطباعة</button></section></div>`;
   const q = $("#q");
@@ -260,7 +276,7 @@ function viewPOS() {
     const list = S.products.filter(p => !t || (p.name || "").toLowerCase().includes(t) || (p.barcode || "").includes(t)).slice(0, 40);
     $("#res").innerHTML = list.map(p => {
       const dl = p.expiry ? daysLeft(p.expiry) : 999;
-      return `<div data-id="${p.id}"><span>${esc(p.name)}<small>${p.barcode ? esc(p.barcode) + " • " : ""}مخزون: ${p.qty ?? 0}${dl <= (S.settings.warnDays || 60) ? ` <span class="tag ${dl < 0 ? "red" : "org"}">${dl < 0 ? "منتهي" : "ينتهي بعد " + dl + " يوم"}</span>` : ""}</small></span><b>${nf(priceSDG(p))} ج</b></div>`;
+      return `<div data-id="${p.id}"><span>${CATS[catOf(p)].icon} ${esc(p.name)}<small>${p.barcode ? esc(p.barcode) + " • " : ""}مخزون: ${p.qty ?? 0}${dl <= (S.settings.warnDays || 60) ? ` <span class="tag ${dl < 0 ? "red" : "org"}">${dl < 0 ? "منتهي" : "ينتهي بعد " + dl + " يوم"}</span>` : ""}</small></span><b>${nf(priceSDG(p))} ج</b></div>`;
     }).join("") || `<div style="justify-content:center;color:var(--mut)">لا نتائج</div>`;
     $("#res").querySelectorAll("[data-id]").forEach(d => d.onclick = () => { addToCart(d.dataset.id); });
   };
@@ -293,7 +309,7 @@ function viewPOS() {
   };
   $("#cam").onclick = () => scan(code => { const p = S.products.find(x => x.barcode === code); p ? addToCart(p.id) : toast("باركود غير مسجل: " + code); });
   $("#disc").oninput = cart;
-  $("#pay").onchange = e => $("#creditBox").classList.toggle("hide", e.target.value !== "credit");
+  $("#pay").onchange = e => { $("#creditBox").classList.toggle("hide", e.target.value !== "credit"); $("#refBox").classList.toggle("hide", e.target.value !== "transfer"); };
   $("#co").onclick = checkout;
   S.refresh = () => { results(); cart(); };
   S.refresh(); q.focus();
@@ -302,15 +318,15 @@ function viewPOS() {
 function checkout() {
   if (!S.cart.length) return toast("السلة فارغة");
   const rate = Number(S.settings.rate); if (!rate) return toast("أدخل سعر الدولار أولاً");
-  const items = S.cart.map(c => { const p = S.products.find(x => x.id === c.id); return { id: p.id, name: p.name, qty: c.qty, priceUSD: p.priceUSD, costUSD: p.costUSD || 0, price: priceSDG(p) }; });
+  const items = S.cart.map(c => { const p = S.products.find(x => x.id === c.id); return { id: p.id, name: p.name, cat: catOf(p), qty: c.qty, price: priceSDG(p), cost: costOf(p) }; });
   const subtotal = items.reduce((a, i) => a + i.price * i.qty, 0);
   const discount = Math.max(0, Number($("#disc").value) || 0), total = Math.max(0, subtotal - discount);
-  const cost = items.reduce((a, i) => a + i.costUSD * i.qty * rate, 0);
+  const cost = items.reduce((a, i) => a + (i.cost || 0) * i.qty, 0);
   const pay = $("#pay").value;
   if (pay === "credit" && !$("#cn").value.trim()) return toast("اكتب اسم العميل للبيع الآجل");
   const now = new Date();
   const no = `${ymd(now).replace(/-/g, "").slice(2)}-${pad2(now.getHours())}${pad2(now.getMinutes())}${Math.floor(Math.random() * 90 + 10)}`;
-  const sale = { no, items, subtotal, discount, total, cost, profit: total - cost, rate, pay, customer: pay === "credit" ? $("#cn").value.trim() : "", phone: pay === "credit" ? $("#cph").value.replace(/\D/g, "") : "", cashier: S.profile.name, cashierUid: S.user.uid, day: ymd(now), month: ym(now) };
+  const sale = { no, items, subtotal, discount, total, cost, profit: total - cost, rate, pay, customer: pay === "credit" ? $("#cn").value.trim() : "", ref: pay === "transfer" ? $("#rf").value.trim() : "", phone: pay === "credit" ? $("#cph").value.replace(/\D/g, "") : "", cashier: S.profile.name, cashierUid: S.user.uid, day: ymd(now), month: ym(now) };
   const ref = doc(collection(db, "sales")), b = writeBatch(db);
   b.set(ref, { ...sale, createdAt: serverTimestamp() });
   items.forEach(i => b.update(doc(db, "products", i.id), { qty: increment(-i.qty) }));
@@ -325,7 +341,7 @@ function waText(s) {
   const d = toDate(s.at || s.createdAt);
   return `🧾 *فاتورة ${s.no}* — ${S.settings.pharmacy}\n📅 ${fmtTime(d)}\n👤 الصيدلي: ${s.cashier}\n────────────\n` +
     s.items.map(i => `• ${i.name} × ${i.qty} = ${nf(i.price * i.qty)}`).join("\n") +
-    `\n────────────\n${s.discount ? `خصم: ${nf(s.discount)} ج\n` : ""}💰 *الإجمالي: ${nf(s.total)} ج* (${(s.total / s.rate).toFixed(2)}$)\nسعر الدولار: ${nf(s.rate)}\nالدفع: ${s.pay === "credit" ? "آجل — " + s.customer : "نقدي"}${isAdmin() ? `\n📈 الربح: ${nf(s.profit)} ج` : ""}`;
+    `\n────────────\n${s.discount ? `خصم: ${nf(s.discount)} ج\n` : ""}💰 *الإجمالي: ${nf(s.total)} ج* (${(s.total / s.rate).toFixed(2)}$)\nسعر الدولار: ${nf(s.rate)}\nالدفع: ${payTxt(s)}${isAdmin() ? `\n📈 الربح: ${nf(s.profit)} ج` : ""}`;
 }
 const waLink = (phone, text) => `https://wa.me/${String(phone || "").replace(/\D/g, "")}?text=${encodeURIComponent(text)}`;
 function showReceipt(sale, autoPrint) {
@@ -345,12 +361,23 @@ function showReceipt(sale, autoPrint) {
   });
   $("#rp", m).onclick = () => printReceipt(sale);
   $("#rw", m).onclick = () => window.open(waLink(S.settings.adminPhone, waText(sale)), "_blank");
-  $("#rn", m).onclick = () => { const w = window.open(""); w.document.write(`<img src="${c.toDataURL()}" style="width:300px" onload="print()">`); };
+  $("#rn", m).onclick = () => printNormal(c, sale);
   if (autoPrint && PR.ch) printReceipt(sale);
+}
+
+/* ---- طباعة عادية ثم فتح واتساب المدير تلقائياً بنص الفاتورة ---- */
+function printNormal(c, sale) {
+  const w = window.open(""); if (!w) return toast("المتصفح منع نافذة الطباعة — اسمح بالنوافذ المنبثقة");
+  const wa = S.settings.adminPhone ? waLink(S.settings.adminPhone, waText(sale)) : "";
+  w.document.write(`<body style="margin:0;text-align:center;font-family:Tahoma,Arial"><style>@media print{.noprint{display:none}}</style><img src="${c.toDataURL()}" style="width:300px" onload="print()">${wa ? `<p class="noprint"><a href="${wa}" style="display:inline-block;background:#25D366;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-size:16px">📲 إرسال الفاتورة للمدير (واتساب)</a></p>` : ""}</body>`);
+  w.document.close();
+  if (wa) w.addEventListener("afterprint", () => { w.location.href = wa; }); // بعد الطباعة تُفتح رسالة واتساب جاهزة للمدير
+  else toast("أدخل رقم واتساب المدير في الإعدادات ليُرسل بعد الطباعة");
 }
 
 /* ---- طباعة بلوتوث (ESC/POS صورة، تدعم العربية) ---- */
 let PR = { dev: null, ch: null };
+const LOGO_PR = new Image(); LOGO_PR.src = "logo-print.png"; // شعار الإيصال (أبيض وأسود للطابعة الحرارية)
 const SERVICES = ["000018f0-0000-1000-8000-00805f9b34fb", "0000ffe0-0000-1000-8000-00805f9b34fb", "49535343-fe7d-4ae5-8fa9-9fafd205e455", "e7810a71-73ae-499d-8c15-faa9aef0c3f2", "0000ff00-0000-1000-8000-00805f9b34fb", "0000fff0-0000-1000-8000-00805f9b34fb", "0000ae30-0000-1000-8000-00805f9b34fb"];
 async function connectPrinter() {
   if (!navigator.bluetooth) throw new Error("المتصفح لا يدعم البلوتوث — استخدم Chrome على الأندرويد");
@@ -395,6 +422,7 @@ function receiptCanvas(sale) {
   const line = () => rows.push({ k: "d", h: 12 });
   const wrap = (t, s, b) => { mc.font = font(s, b); const out = []; let cur = ""; for (const w of String(t).split(" ")) { const tr = cur ? cur + " " + w : w; if (mc.measureText(tr).width > W - 2 * P && cur) { out.push(cur); cur = w; } else cur = tr; } out.push(cur); return out; };
   const d = toDate(sale.at || sale.createdAt);
+  if (LOGO_PR.complete && LOGO_PR.naturalWidth) { const lw = Math.min(W * 0.7, 280), lh = Math.round(lw * LOGO_PR.naturalHeight / LOGO_PR.naturalWidth); rows.push({ k: "img", lw, lh, h: lh + 8 }); }
   center(S.settings.pharmacy, fs + 6, true); center(`فاتورة ${sale.no}`); center(fmtTime(d), fs - 4); center(`الصيدلي: ${sale.cashier}`, fs - 4); line();
   sale.items.forEach(i => { wrap(i.name, fs, true).forEach(t => rows.push({ k: "r", t, s: fs, b: true, h: fs + 6 })); lr(`${i.qty} × ${nf(i.price)}`, nf(i.price * i.qty), fs - 2); });
   line();
@@ -402,13 +430,14 @@ function receiptCanvas(sale) {
   lr("الإجمالي", nf(sale.total) + " ج", fs + 4, true);
   lr("بالدولار", (sale.total / sale.rate).toFixed(2) + " $", fs - 2);
   center(`سعر الدولار: ${nf(sale.rate)}`, fs - 4);
-  if (sale.pay === "credit") center(`آجل: ${sale.customer}`, fs, true);
+  center(`الدفع: ${payTxt(sale)}`, fs - 2, sale.pay === "credit");
   line(); center("شكراً لزيارتكم — الله يشفيكم", fs - 2); rows.push({ k: "d", h: 20 });
   const c = document.createElement("canvas"); c.width = W; c.height = rows.reduce((a, r) => a + r.h, 10);
   const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, W, c.height); x.fillStyle = "#000"; x.textBaseline = "top"; x.direction = "rtl";
   let y = 5;
   for (const r of rows) {
-    if (r.k === "d") { x.fillRect(P, y + r.h / 2, W - 2 * P, 2); }
+    if (r.k === "img") { x.drawImage(LOGO_PR, (W - r.lw) / 2, y, r.lw, r.lh); }
+    else if (r.k === "d") { x.fillRect(P, y + r.h / 2, W - 2 * P, 2); }
     else { x.font = font(r.s, r.b); if (r.k === "c") { x.textAlign = "center"; x.fillText(r.t, W / 2, y); } else if (r.k === "r") { x.textAlign = "right"; x.fillText(r.t, W - P, y); } else { x.textAlign = "right"; x.fillText(r.l, W - P, y); x.textAlign = "left"; x.fillText(r.r, P, y); } }
     y += r.h;
   }
@@ -444,39 +473,45 @@ async function scan(cb) {
 }
 
 /* ============ الأصناف ============ */
-function viewProducts() {
-  $("#main").innerHTML = `<div class="card"><div class="row"><input id="pq" placeholder="بحث بالاسم أو الباركود"><button class="btn" id="pc">📷</button><button class="btn" id="pa">+ صنف</button></div><div id="pl" class="list" style="margin-top:6px"></div></div>`;
+function viewProducts(cat = "med") {
+  const C = CATS[cat];
+  $("#main").innerHTML = `<div class="card"><h3 style="margin:0 0 8px">${C.icon} ${C.label}</h3><div class="row"><input id="pq" placeholder="بحث في ${C.label} بالاسم أو الباركود"><button class="btn" id="pc">📷</button><button class="btn" id="pa">+ صنف</button></div><div id="pl" class="list" style="margin-top:6px"></div></div>`;
   const draw = () => {
     const t = $("#pq").value.trim().toLowerCase();
-    const l = S.products.filter(p => !t || p.name.toLowerCase().includes(t) || (p.barcode || "").includes(t));
-    $("#pl").innerHTML = l.map(p => { const dl = p.expiry ? daysLeft(p.expiry) : 999; return `<div data-id="${p.id}"><span>${esc(p.name)}<small>${esc(p.barcode || "بدون باركود")} • مخزون ${p.qty ?? 0}${p.expiry ? " • صلاحية " + p.expiry : ""} ${dl <= (S.settings.warnDays || 60) ? `<span class="tag ${dl < 0 ? "red" : "org"}">${dl < 0 ? "منتهي" : dl + " يوم"}</span>` : ""}</small></span><span style="text-align:left"><b>${nf(priceSDG(p))} ج</b><small>${p.priceUSD}$</small></span></div>`; }).join("") || `<p style="text-align:center;color:var(--mut)">لا أصناف</p>`;
+    const l = S.products.filter(p => catOf(p) === cat && (!t || p.name.toLowerCase().includes(t) || (p.barcode || "").includes(t)));
+    $("#pl").innerHTML = l.map(p => { const dl = p.expiry ? daysLeft(p.expiry) : 999; return `<div data-id="${p.id}"><span>${esc(p.name)}<small>${esc(p.barcode || "بدون باركود")} • مخزون ${p.qty ?? 0}${p.expiry ? " • صلاحية " + p.expiry : ""} ${dl <= (S.settings.warnDays || 60) ? `<span class="tag ${dl < 0 ? "red" : "org"}">${dl < 0 ? "منتهي" : dl + " يوم"}</span>` : ""}</small></span><span style="text-align:left"><b>${nf(priceSDG(p))} ج</b><small>${r2(toUSD(priceSDG(p)))}$</small></span></div>`; }).join("") || `<p style="text-align:center;color:var(--mut)">لا أصناف في ${C.label}</p>`;
     $("#pl").querySelectorAll("[data-id]").forEach(d => d.onclick = () => productModal(S.products.find(p => p.id === d.dataset.id)));
   };
-  $("#pq").oninput = draw; $("#pa").onclick = () => productModal(null);
-  $("#pc").onclick = () => scan(code => { const p = S.products.find(x => x.barcode === code); p ? productModal(p) : productModal(null, code); });
+  $("#pq").oninput = draw; $("#pa").onclick = () => productModal(null, "", cat);
+  $("#pc").onclick = () => scan(code => { const p = S.products.find(x => x.barcode === code); p ? productModal(p) : productModal(null, code, cat); });
   S.refresh = draw; draw();
 }
-function productModal(p, bc = "") {
-  const adm = isAdmin(), lock = p && !adm;
-  const initM = p ? (p.markup ?? (p.costUSD > 0 && p.priceUSD > 0 ? Math.round((p.priceUSD / p.costUSD - 1) * 1000) / 10 : "")) : (S.settings.defaultMarkup ?? "");
+function productModal(p, bc = "", cat0 = "med") {
+  const adm = isAdmin(), lock = p && !adm, cat = p ? catOf(p) : cat0;
+  const c0 = p ? r2(costOf(p)) : "", pr0 = p ? r2(priceSDG(p)) : "";
+  const initM = p ? (p.markup ?? (c0 > 0 && pr0 > 0 ? Math.round((pr0 / c0 - 1) * 1000) / 10 : "")) : catMarkup(cat);
+  let dirty = !p; // لا نعيد حساب الدولار إن لم تتغير التكلفة/السعر
   const m = modal(`<h3>${p ? "تعديل صنف" : "صنف جديد"}</h3>${lock ? `<p style="font-size:13px;color:var(--mut)">الصيدلي يستطيع تعديل الكمية فقط.</p>` : ""}
+  <label>القسم</label><select id="fcat" ${lock ? "disabled" : ""}>${Object.entries(CATS).map(([k, v]) => `<option value="${k}" ${k === cat ? "selected" : ""}>${v.icon} ${v.label}</option>`).join("")}</select>
   <label>الاسم</label><input id="fn" value="${esc(p?.name)}" ${lock ? "disabled" : ""}>
   <label>الباركود</label><div class="row"><input id="fb" value="${esc(p?.barcode || bc)}" ${lock ? "disabled" : ""}>${lock ? "" : `<button class="btn sec" id="fs">📷</button>`}</div>
-  <div class="row"><div><label>التكلفة ($)</label><input id="fc" type="number" step="0.01" inputmode="decimal" value="${p?.costUSD ?? ""}" ${lock ? "disabled" : ""}></div>
+  <div class="row"><div><label>التكلفة (ج)</label><input id="fc" type="number" step="0.01" inputmode="decimal" value="${c0}" ${lock ? "disabled" : ""}></div>
   <div><label>نسبة الربح %</label><input id="fm" type="number" step="0.1" inputmode="decimal" value="${initM}" ${lock ? "disabled" : ""}></div>
-  <div><label>سعر البيع ($)</label><input id="fp" type="number" step="0.01" inputmode="decimal" value="${p?.priceUSD ?? ""}" ${lock ? "disabled" : ""}></div></div>
-  <p id="fsd" style="color:var(--p);font-weight:bold;margin:6px 0"></p>
+  <div><label>سعر البيع (ج)</label><input id="fp" type="number" step="0.01" inputmode="decimal" value="${pr0}" ${lock ? "disabled" : ""}></div></div>
+  <p id="fsd" style="color:var(--p);font-weight:bold;margin:6px 0;font-size:14px"></p>
   <div class="row"><div><label>الكمية</label><input id="fq" type="number" inputmode="numeric" value="${p?.qty ?? ""}"></div>
   <div><label>تاريخ الانتهاء</label><input id="fe" type="date" value="${p?.expiry || ""}" ${lock ? "disabled" : ""}></div></div>
   <div class="row" style="margin-top:12px"><button class="btn" id="fok">حفظ</button>${p && adm ? `<button class="btn danger" id="fdel">حذف</button>` : ""}<button class="btn sec" id="fx">إلغاء</button></div>`);
-  const r2 = v => Math.round(v * 100) / 100;
   const upd = () => {
-    const c = Number($("#fc", m).value) || 0, pr = Number($("#fp", m).value) || 0;
-    $("#fsd", m).textContent = `بالجنيه اليوم: ${nf(priceSDG({ priceUSD: pr }))} ج` + (c > 0 && pr > 0 ? ` • ربح الوحدة: ${nf((pr - c) * (Number(S.settings.rate) || 0))} ج (${((pr / c - 1) * 100).toFixed(1)}%)` : "");
+    const c = Number($("#fc", m).value) || 0, pr = Number($("#fp", m).value) || 0, rt = Number(S.settings.rate) || 0;
+    $("#fsd", m).innerHTML = rt
+      ? `بالدولار (1$ = ${nf(rt)} ج): التكلفة <b>$${r2(c / rt)}</b> • البيع <b>$${r2(pr / rt)}</b>` + (c > 0 && pr > 0 ? `<br>ربح الوحدة: ${nf(pr - c)} ج (${((pr / c - 1) * 100).toFixed(1)}%)` : "") + `<br><small style="font-weight:normal;color:var(--mut)">سعر البيع يتحرك تلقائياً مع سعر الدولار اليومي</small>`
+      : "⚠ أدخل سعر الدولار ليظهر المقابل بالدولار";
   };
-  const fromMarkup = () => { const c = Number($("#fc", m).value); if (c > 0 && $("#fm", m).value !== "") $("#fp", m).value = r2(c * (1 + Number($("#fm", m).value) / 100)); upd(); };
+  const fromMarkup = () => { const c = Number($("#fc", m).value); if (c > 0 && $("#fm", m).value !== "") { const x = c * (1 + Number($("#fm", m).value) / 100); $("#fp", m).value = roundTo(x) || r2(x); } upd(); };
   const fromPrice = () => { const c = Number($("#fc", m).value), pr = Number($("#fp", m).value); if (c > 0 && pr > 0) $("#fm", m).value = Math.round((pr / c - 1) * 1000) / 10; upd(); };
-  $("#fc", m).oninput = fromMarkup; $("#fm", m).oninput = fromMarkup; $("#fp", m).oninput = fromPrice; upd();
+  $("#fc", m).oninput = () => { dirty = true; fromMarkup(); }; $("#fm", m).oninput = () => { dirty = true; fromMarkup(); }; $("#fp", m).oninput = () => { dirty = true; fromPrice(); }; upd();
+  $("#fcat", m).onchange = () => { if (!p) { $("#fm", m).value = catMarkup($("#fcat", m).value); fromMarkup(); } }; // نسبة الربح حسب القسم
   $("#fs", m) && ($("#fs", m).onclick = () => scan(c => $("#fb", m).value = c));
   $("#fx", m).onclick = m.close;
   $("#fdel", m) && ($("#fdel", m).onclick = async () => { if (confirm("حذف الصنف؟")) { await deleteDoc(doc(db, "products", p.id)); m.close(); } });
@@ -485,7 +520,9 @@ function productModal(p, bc = "") {
     if (lock) { updateDoc(doc(db, "products", p.id), { qty }).catch(e => toast(e.message)); m.close(); return; }
     if (!name) return toast("اكتب الاسم");
     if (barcode && S.products.some(x => x.barcode === barcode && x.id !== p?.id)) return toast("هذا الباركود مسجل لصنف آخر");
-    const data = { name, barcode, priceUSD: Number($("#fp", m).value) || 0, costUSD: Number($("#fc", m).value) || 0, markup: Number($("#fm", m).value) || 0, qty, expiry: $("#fe", m).value || "" };
+    const costS = Number($("#fc", m).value) || 0, priceS = Number($("#fp", m).value) || 0, rt = Number(S.settings.rate) || 0;
+    if (dirty && !rt) return toast("أدخل سعر الدولار أولاً (من الشارة أعلى الشاشة)");
+    const data = { name, barcode, cat: $("#fcat", m).value, ...(dirty ? { costUSD: p6(costS / rt), priceUSD: p6(priceS / rt) } : {}), markup: Number($("#fm", m).value) || 0, qty, expiry: $("#fe", m).value || "" };
     (p ? updateDoc(doc(db, "products", p.id), data) : addDoc(collection(db, "products"), { ...data, createdAt: serverTimestamp() })).catch(e => toast(e.message));
     m.close(); toast("تم الحفظ");
   };
@@ -496,7 +533,7 @@ function sumSales(l) { return { n: l.length, total: l.reduce((a, s) => a + (s.to
 function viewDash() {
   $("#main").innerHTML = `<div class="card"><h3>🔴 مباشر — اليوم</h3><div class="grid" id="td"></div></div>
   <div class="card"><div class="row"><h3 style="flex:1;margin:0">📅 الأرباح الشهرية</h3><input type="month" id="mp" value="${S.month}" style="max-width:170px"></div><div class="grid" id="mn" style="margin-top:8px"></div></div>
-  <div class="card"><h3>⚠ تنبيهات</h3><div id="al"></div></div>
+  <div class="card" id="alc" style="cursor:pointer"></div>
   <div class="card"><div class="row"><h3 style="flex:1;margin:0">آخر مبيعات اليوم</h3><button class="btn wa sm" id="dwa">تقرير اليوم واتساب</button></div><div id="ls" class="list"></div></div>`;
   $("#mp").onchange = e => { S.month = e.target.value || ym(new Date()); listenMonth(); };
   $("#dwa").onclick = () => { const t = sumSales(S.todaySales); window.open(waLink(S.settings.adminPhone, `📊 تقرير ${ymd(new Date())} — ${S.settings.pharmacy}\nعدد الفواتير: ${t.n}\nالمبيعات: ${nf(t.total)} ج\nالربح: ${nf(t.profit)} ج\nسعر الدولار: ${nf(S.settings.rate)}`), "_blank"); };
@@ -505,18 +542,30 @@ function viewDash() {
     const t = sumSales(S.todaySales), m = sumSales(S.monthSales);
     $("#td").innerHTML = stat("المبيعات", nf(t.total) + " ج") + stat("الأرباح", nf(t.profit) + " ج") + stat("عدد الفواتير", t.n) + stat("بالدولار", "$" + (S.settings.rate ? (t.total / S.settings.rate).toFixed(0) : 0));
     $("#mn").innerHTML = stat("مبيعات الشهر", nf(m.total) + " ج") + stat("أرباح الشهر", nf(m.profit) + " ج") + stat("الفواتير", m.n) + stat("متوسط الفاتورة", nf(m.n ? m.total / m.n : 0) + " ج") + stat("نسبة الربح", (m.total ? (m.profit / m.total * 100).toFixed(1) : 0) + "%");
-    $("#ls").innerHTML = S.todaySales.slice(0, 30).map(s => `<div data-id="${s.id}"><span>${esc(s.no)} <small>${fmtTime(toDate(s.createdAt)).slice(11)} • ${esc(s.cashier)} • ${s.items.length} صنف${s.pay === "credit" ? " • آجل" : ""}</small></span><b>${nf(s.total)} ج</b></div>`).join("") || `<p style="text-align:center;color:var(--mut)">لا مبيعات بعد</p>`;
+    $("#ls").innerHTML = S.todaySales.slice(0, 30).map(s => `<div data-id="${s.id}"><span>${esc(s.no)} <small>${fmtTime(toDate(s.createdAt)).slice(11)} • ${esc(s.cashier)} • ${s.items.length} صنف${s.pay === "credit" ? " • آجل" : s.pay === "transfer" ? " • تحويل" : ""}</small></span><b>${nf(s.total)} ج</b></div>`).join("") || `<p style="text-align:center;color:var(--mut)">لا مبيعات بعد</p>`;
     $("#ls").querySelectorAll("[data-id]").forEach(d => d.onclick = () => showReceipt(S.todaySales.find(s => s.id === d.dataset.id)));
-    $("#al").innerHTML = alerts().map(a => `<div class="alert ${a.red ? "red" : ""}">${a.t}</div>`).join("") || `<p style="color:var(--grn)">لا تنبيهات ✔</p>`;
+    const nal = alerts().length; $("#alc").innerHTML = nal ? `<h3 style="margin:0">⚠ ${nal} تنبيه (شيكات / ديون / انتهاء صلاحية) — اضغط للعرض</h3>` : `<p style="color:var(--grn);margin:0">لا تنبيهات ✔</p>`;
+    $("#alc").onclick = () => { S.tab = "alerts"; showApp(); };
   };
   S.refresh();
 }
 function alerts() {
-  const out = [], w = S.settings.warnDays || 60;
-  S.products.filter(p => p.expiry && daysLeft(p.expiry) <= w).sort((a, b) => a.expiry.localeCompare(b.expiry)).forEach(p => { const d = daysLeft(p.expiry); out.push({ red: d < 0, t: `💊 ${esc(p.name)} — ${d < 0 ? "منتهي منذ " + -d + " يوم" : "ينتهي بعد " + d + " يوم"} (كمية ${p.qty ?? 0})` }); });
-  S.debts.filter(d => !d.paid && d.dueDate && daysLeft(d.dueDate) <= 7).forEach(d => { const x = daysLeft(d.dueDate); out.push({ red: x < 0, t: `💳 دين ${esc(d.name)}: ${nf(d.amount)} ج — ${x < 0 ? "متأخر " + -x + " يوم" : "بعد " + x + " يوم"}` }); });
-  S.cheques.filter(c => !c.done && c.dueDate && daysLeft(c.dueDate) <= 7).forEach(c => { const x = daysLeft(c.dueDate); out.push({ red: x < 0, t: `🧾 شيك ${esc(c.party)} (${c.type === "in" ? "وارد" : "صادر"}): ${nf(c.amount)} — ${x < 0 ? "متأخر " + -x + " يوم" : "بعد " + x + " يوم"}` }); });
+  const out = [], w = S.settings.warnDays || 60, cd = S.settings.chequeDays ?? 7;
+  S.products.filter(p => p.expiry && daysLeft(p.expiry) <= w).forEach(p => { const d = daysLeft(p.expiry); out.push({ g: "exp", d, red: d < 0, t: `${CATS[catOf(p)].icon} ${esc(p.name)} — ${d < 0 ? "منتهي منذ " + -d + " يوم" : d === 0 ? "ينتهي اليوم" : "ينتهي بعد " + d + " يوم"} (كمية ${p.qty ?? 0})` }); });
+  S.debts.filter(d => !d.paid && d.dueDate && daysLeft(d.dueDate) <= cd).forEach(d => { const x = daysLeft(d.dueDate); out.push({ g: "debt", d: x, red: x < 0, t: `💳 دين ${esc(d.name)}: ${nf(d.amount)} ج — ${dueTxt(x)}` }); });
+  S.cheques.filter(c => !c.done && c.dueDate && daysLeft(c.dueDate) <= cd).forEach(c => { const x = daysLeft(c.dueDate); out.push({ g: "chq", d: x, red: x < 0, t: `🧾 شيك ${esc(c.party)}${c.no ? " (رقم " + esc(c.no) + ")" : ""} — ${c.type === "in" ? "وارد" : "صادر"}: ${nf(c.amount)} ج — استحقاق ${c.dueDate} (${dueTxt(x)})` }); });
   return out;
+}
+function viewAlerts() {
+  $("#main").innerHTML = `<div class="card"><h3>🔔 التنبيهات</h3><div id="alx"></div></div>`;
+  S.refresh = () => {
+    const l = alerts(), G = [["chq", "🧾 شيكات قريبة الاستحقاق"], ["debt", "💳 ديون مستحقة"], ["exp", "💊 أصناف قاربت على الانتهاء"]];
+    $("#alx").innerHTML = G.map(([g, t]) => {
+      const a = l.filter(x => x.g === g).sort((x, y) => x.d - y.d); if (!a.length) return "";
+      return `<h4 style="margin:12px 0 6px">${t} (${a.length})</h4>` + a.map(x => `<div class="alert ${x.red ? "red" : ""}">${x.t}</div>`).join("");
+    }).join("") || `<p style="color:var(--grn);text-align:center">لا تنبيهات ✔</p>`;
+  };
+  S.refresh();
 }
 
 /* ============ إقفال حساب الصيدلي ============ */
@@ -524,13 +573,13 @@ async function closeShift() {
   const last = Math.max(0, ...S.myClosings.map(c => toDate(c.closedAt).getTime()));
   const list = S.mineToday.filter(s => toDate(s.createdAt).getTime() > last).sort((a, b) => toDate(a.createdAt) - toDate(b.createdAt));
   if (!list.length) return toast("لا فواتير جديدة منذ آخر إقفال");
-  const t = sumSales(list), credit = list.filter(s => s.pay === "credit").reduce((a, s) => a + s.total, 0), cash = t.total - credit, now = new Date();
-  if (!confirm(`إقفال الحساب: ${t.n} فاتورة بإجمالي ${nf(t.total)} ج (نقدي ${nf(cash)} • آجل ${nf(credit)}). سيُرسل التقرير للمدير. متابعة؟`)) return;
-  addDoc(collection(db, "closings"), { uid: S.user.uid, name: S.profile.name, day: ymd(now), count: t.n, total: t.total, profit: t.profit, cash, credit, closedAt: serverTimestamp() }).catch(e => toast("تعذر الحفظ: " + e.message));
+  const t = sumSales(list), credit = list.filter(s => s.pay === "credit").reduce((a, s) => a + s.total, 0), transfer = list.filter(s => s.pay === "transfer").reduce((a, s) => a + s.total, 0), cash = t.total - credit - transfer, now = new Date();
+  if (!confirm(`إقفال الحساب: ${t.n} فاتورة بإجمالي ${nf(t.total)} ج (نقدي ${nf(cash)} • تحويل ${nf(transfer)} • آجل ${nf(credit)}). سيُرسل التقرير للمدير. متابعة؟`)) return;
+  addDoc(collection(db, "closings"), { uid: S.user.uid, name: S.profile.name, day: ymd(now), count: t.n, total: t.total, profit: t.profit, cash, transfer, credit, closedAt: serverTimestamp() }).catch(e => toast("تعذر الحفظ: " + e.message));
   const tb = `<table border="1" cellpadding="6" style="border-collapse:collapse;width:100%">`;
-  const rows = list.map((s, i) => `<tr><td>${i + 1}</td><td>${esc(s.no)}</td><td>${fmtTime(toDate(s.createdAt)).slice(11)}</td><td>${s.items.map(x => `${esc(x.name)} ×${x.qty}`).join("، ")}</td><td>${s.pay === "credit" ? "آجل — " + esc(s.customer) : "نقدي"}</td><td>${nf(s.total)}</td></tr>`).join("");
+  const rows = list.map((s, i) => `<tr><td>${i + 1}</td><td>${esc(s.no)}</td><td>${fmtTime(toDate(s.createdAt)).slice(11)}</td><td>${s.items.map(x => `${esc(x.name)} ×${x.qty}`).join("، ")}</td><td>${esc(payTxt(s))}</td><td>${nf(s.total)}</td></tr>`).join("");
   const html = `<div dir="rtl" style="font-family:Tahoma,Arial;max-width:680px"><h2>🔒 إقفال حساب — ${esc(S.profile.name)}</h2><p>${esc(S.settings.pharmacy)} • ${fmtTime(now)}<br>الفواتير من ${fmtTime(toDate(list[0].createdAt)).slice(11)} إلى ${fmtTime(toDate(list[list.length - 1].createdAt)).slice(11)}</p>
-<p>عدد الفواتير: <b>${t.n}</b><br>إجمالي الإيراد: <b>${nf(t.total)} ج</b><br>نقدي: ${nf(cash)} ج • آجل: ${nf(credit)} ج<br>سعر الدولار: ${nf(S.settings.rate)}<br>📈 الربح: ${nf(t.profit)} ج</p>
+<p>عدد الفواتير: <b>${t.n}</b><br>إجمالي الإيراد: <b>${nf(t.total)} ج</b><br>نقدي: ${nf(cash)} ج • تحويل: ${nf(transfer)} ج • آجل: ${nf(credit)} ج<br>سعر الدولار: ${nf(S.settings.rate)}<br>📈 الربح: ${nf(t.profit)} ج</p>
 ${tb}<tr><th>#</th><th>الفاتورة</th><th>الوقت</th><th>الأصناف</th><th>الدفع</th><th>المبلغ</th></tr>${rows}</table><h3>الأصناف المباعة</h3>${aggItems(list).replace("<table>", tb)}</div>`;
   toast(queueMail(`🔒 إقفال ${S.profile.name} — ${nf(t.total)} ج (${t.n} فاتورة)`, html) ? "تم الإقفال وإرسال التقرير للمدير" : "تم الإقفال (الإيميل غير مفعّل في الإعدادات)");
 }
@@ -544,7 +593,7 @@ function aggItems(list) {
   return rows.length ? `<table><tr><th>الصنف</th><th>الكمية</th><th>المبلغ (ج)</th></tr>${rows.map(r => `<tr><td>${esc(r.name)}</td><td>${r.qty}</td><td>${nf(r.sum)}</td></tr>`).join("")}</table>` : `<p style="text-align:center;color:var(--mut)">لا مبيعات</p>`;
 }
 function invRow(s) {
-  return `<div data-id="${s.id}"><span>${esc(s.no)} <small>${fmtTime(toDate(s.createdAt))} • ${s.items.length} صنف${s.pay === "credit" ? " • آجل" : ""}</small><small style="color:var(--tx);white-space:normal">${s.items.map(i => `${esc(i.name)} ×${i.qty}`).join(" ، ")}</small></span><b>${nf(s.total)} ج</b></div>`;
+  return `<div data-id="${s.id}"><span>${esc(s.no)} <small>${fmtTime(toDate(s.createdAt))} • ${s.items.length} صنف${s.pay === "credit" ? " • آجل" : s.pay === "transfer" ? " • تحويل" : ""}</small><small style="color:var(--tx);white-space:normal">${s.items.map(i => `${esc(i.name)} ×${i.qty}`).join(" ، ")}</small></span><b>${nf(s.total)} ج</b></div>`;
 }
 function viewMine() {
   $("#main").innerHTML = `<div class="card"><button class="btn big" id="cls">🔒 إقفال حسابي وإرسال التقرير للمدير</button><p id="clsi" style="font-size:13px;color:var(--mut);text-align:center;margin:6px 0 0"></p></div>
@@ -580,7 +629,7 @@ function viewPharm() {
       <table><tr><th></th><th>فواتير</th><th>الإيراد (ج)</th><th>الربح (ج)</th></tr><tr><td>اليوم</td><td>${t.n}</td><td>${nf(t.total)}</td><td>${nf(t.profit)}</td></tr><tr><td>الشهر</td><td>${m.n}</td><td>${nf(m.total)}</td><td>${nf(m.profit)}</td></tr></table></div>`;
     }).join("") || `<p style="text-align:center;color:var(--mut)">لا حسابات</p>`;
     $("#pc").querySelectorAll("[data-u]").forEach(d => d.onclick = () => { S.selPh = d.dataset.u; S.refresh(); });
-    $("#pcl").innerHTML = S.closings.slice(0, 20).map(c => `<div style="cursor:default"><span>${esc(c.name)} <small>${fmtTime(toDate(c.closedAt))} • ${c.count} فاتورة • نقدي ${nf(c.cash)} • آجل ${nf(c.credit)}</small></span><b>${nf(c.total)} ج</b></div>`).join("") || `<p style="text-align:center;color:var(--mut)">لا إقفالات بعد</p>`;
+    $("#pcl").innerHTML = S.closings.slice(0, 20).map(c => `<div style="cursor:default"><span>${esc(c.name)} <small>${fmtTime(toDate(c.closedAt))} • ${c.count} فاتورة • نقدي ${nf(c.cash)} • تحويل ${nf(c.transfer || 0)} • آجل ${nf(c.credit)}</small></span><b>${nf(c.total)} ج</b></div>`).join("") || `<p style="text-align:center;color:var(--mut)">لا إقفالات بعد</p>`;
     const u = S.users.find(x => x.id === S.selPh), l = S.monthSales.filter(s => s.cashierUid === S.selPh).slice(0, 150);
     $("#pt").textContent = `فواتير ${u ? u.name : ""} — ${S.month}`;
     $("#pa").textContent = `الأصناف التي باعها ${u ? u.name : ""} — ${S.month}`;
@@ -626,11 +675,15 @@ function chequeModal(c) {
 
 /* ============ الإعدادات والمستخدمون ============ */
 function viewSettings() {
+  if (!isAdmin()) return viewPOS();
   $("#main").innerHTML = `<div class="card"><h3>⚙ إعدادات الصيدلية</h3>
   <label>اسم الصيدلية</label><input id="s1" value="${esc(S.settings.pharmacy)}">
   <label>واتساب المدير (مع كود الدولة)</label><input id="s2" inputmode="tel" value="${esc(S.settings.adminPhone)}">
   <div class="row"><div><label>تنبيه الانتهاء قبل (يوم)</label><input id="s3" type="number" value="${S.settings.warnDays}"></div><div><label>تقريب السعر إلى أقرب</label><input id="s4" type="number" value="${S.settings.round}"></div></div>
-  <div class="row"><div><label>نسبة الربح الافتراضية %</label><input id="s6" type="number" step="0.1" inputmode="decimal" value="${S.settings.defaultMarkup ?? 25}"></div><button class="btn sec" id="sap" style="align-self:flex-end">تطبيق على كل الأصناف</button></div>
+  <div class="row"><div><label>تنبيه الشيكات والديون قبل (يوم)</label><input id="s9" type="number" value="${S.settings.chequeDays ?? 7}"></div></div>
+  <label>نسبة الربح % حسب القسم</label>
+  <div class="row"><div><label>💊 أدوية</label><input id="m1" type="number" step="0.1" inputmode="decimal" value="${catMarkup("med")}"></div><div><label>💄 كوزمتك</label><input id="m2" type="number" step="0.1" inputmode="decimal" value="${catMarkup("cos")}"></div><div><label>🛵 دليفري</label><input id="m3" type="number" step="0.1" inputmode="decimal" value="${catMarkup("del")}"></div></div>
+  <button class="btn sec sm" id="sap" style="margin-top:8px">تطبيق النسب على أصناف كل قسم</button>
   <label>رابط سكربت الإيميل (Google Apps Script) — اتركه فارغاً لإيقاف الإيميل</label><input id="s7" placeholder="https://script.google.com/macros/s/.../exec" value="${esc(S.settings.emailHook)}">
   <label>كلمة سر الإيميل (نفس الموجودة في السكربت)</label><input id="s8" value="${esc(S.settings.emailKey)}">
   <button class="btn sec sm" id="smt" style="margin-top:8px">📧 إرسال إيميل تجريبي</button>
@@ -639,7 +692,7 @@ function viewSettings() {
   <label>عرض ورق الطابعة (على هذا الجهاز)</label><select id="s5"><option value="384" ${localStorage.paper !== "576" ? "selected" : ""}>58 مم</option><option value="576" ${localStorage.paper === "576" ? "selected" : ""}>80 مم</option></select>
   <div style="height:10px"></div><button class="btn" id="ss">حفظ</button></div>
   <div class="card"><div class="row"><h3 style="flex:1;margin:0">👥 الحسابات</h3><button class="btn sm" id="ua">+ صيدلي</button></div><div id="ul" class="list"></div></div>`;
-  $("#ss").onclick = async () => { localStorage.paper = $("#s5").value; await setDoc(doc(db, "settings", "main"), { pharmacy: $("#s1").value.trim(), adminPhone: $("#s2").value.replace(/\D/g, ""), warnDays: Number($("#s3").value) || 60, round: Number($("#s4").value) || 1, defaultMarkup: Number($("#s6").value) || 0, emailHook: $("#s7").value.trim(), emailKey: $("#s8").value.trim() }, { merge: true }); toast("تم الحفظ"); };
+  $("#ss").onclick = async () => { localStorage.paper = $("#s5").value; await setDoc(doc(db, "settings", "main"), { pharmacy: $("#s1").value.trim(), adminPhone: $("#s2").value.replace(/\D/g, ""), warnDays: Number($("#s3").value) || 60, round: Number($("#s4").value) || 1, markupMed: Number($("#m1").value) || 0, markupCos: Number($("#m2").value) || 0, markupDel: Number($("#m3").value) || 0, defaultMarkup: Number($("#m1").value) || 0, chequeDays: $("#s9").value === "" ? 7 : Number($("#s9").value) || 0, emailHook: $("#s7").value.trim(), emailKey: $("#s8").value.trim() }, { merge: true }); toast("تم الحفظ"); };
   $("#ua").onclick = userModal;
   $("#bkd").onclick = downloadBackup;
   $("#bke").onclick = async () => toast((await autoBackup(true)) ? "أُرسلت النسخة — افحص بريدك" : "تعذر الإرسال — تحقق من رابط السكربت والإنترنت");
@@ -649,17 +702,22 @@ function viewSettings() {
     catch { toast("تعذر الوصول للرابط — تأكد من الإنترنت ومن الرابط"); }
   };
   $("#sap").onclick = async () => {
-    const mk = Number($("#s6").value);
-    if (!(mk >= 0)) return toast("اكتب نسبة صحيحة");
-    const l = S.products.filter(p => p.costUSD > 0);
+    const mk = { med: Number($("#m1").value), cos: Number($("#m2").value), del: Number($("#m3").value) };
+    if (!Object.values(mk).every(v => v >= 0)) return toast("اكتب نسباً صحيحة");
+    const l = S.products.filter(p => costOf(p) > 0);
     if (!l.length) return toast("لا توجد أصناف لها تكلفة مسجلة");
-    if (!confirm(`سيتم تغيير سعر البيع لـ ${l.length} صنف إلى (التكلفة + ${mk}%) وسيُلغى أي سعر يدوي. متابعة؟`)) return;
+    const cnt = c => l.filter(p => catOf(p) === c).length;
+    if (!confirm(`سيُعاد حساب سعر البيع (التكلفة + النسبة) لـ ${l.length} صنف:\nأدوية ${cnt("med")} (${mk.med}%) • كوزمتك ${cnt("cos")} (${mk.cos}%) • دليفري ${cnt("del")} (${mk.del}%)\nوسيُلغى أي سعر يدوي. متابعة؟`)) return;
+    const rt = Number(S.settings.rate) || 0; if (!rt) return toast("أدخل سعر الدولار أولاً");
     for (let i = 0; i < l.length; i += 400) {
       const b = writeBatch(db);
-      l.slice(i, i + 400).forEach(p => b.update(doc(db, "products", p.id), { markup: mk, priceUSD: Math.round(p.costUSD * (1 + mk / 100) * 100) / 100 }));
+      l.slice(i, i + 400).forEach(p => {
+        const c = catOf(p), cu = Number(p.costUSD) > 0 ? Number(p.costUSD) : costOf(p) / rt;
+        b.update(doc(db, "products", p.id), { cat: c, markup: mk[c], costUSD: p6(cu), priceUSD: p6(cu * (1 + mk[c] / 100)) });
+      });
       await b.commit();
     }
-    await setDoc(doc(db, "settings", "main"), { defaultMarkup: mk }, { merge: true });
+    await setDoc(doc(db, "settings", "main"), { markupMed: mk.med, markupCos: mk.cos, markupDel: mk.del, defaultMarkup: mk.med }, { merge: true });
     toast("تم تحديث أسعار " + l.length + " صنف");
   };
   S.refresh = () => {
